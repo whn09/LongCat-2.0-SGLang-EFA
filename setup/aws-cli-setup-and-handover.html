@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AWS CLI 安装配置与研发组交接指南</title>
+<style>
+  :root {
+    --primary: #232f3e; --accent: #ff9900; --bg: #fafafa;
+    --border: #d5d9dd; --key-bg: #e8f4fd; --key-border: #2e86c1;
+    --warn-bg: #fff8e6; --warn-border: #f0ad4e;
+    --ok-bg: #eafaf1; --ok-border: #27ae60;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+         margin: 0; background: var(--bg); color: #222; line-height: 1.7; }
+  .container { max-width: 1060px; margin: 0 auto; padding: 24px 32px 80px; }
+  header { background: var(--primary); color: #fff; padding: 30px; }
+  header h1 { margin: 0 0 8px; font-size: 22px; }
+  header .sub { color: #ccc; font-size: 13.5px; }
+  h2 { color: var(--primary); border-bottom: 3px solid var(--accent);
+       padding-bottom: 6px; margin-top: 42px; font-size: 20px; }
+  h3 { color: var(--primary); margin-top: 24px; font-size: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; background:#fff; }
+  th, td { border: 1px solid var(--border); padding: 7px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--primary); color: #fff; font-weight: 600; }
+  tr:nth-child(even) { background: #f4f6f8; }
+  code { background: #eef0f3; padding: 1px 6px; border-radius: 4px;
+         font-family: "SF Mono",Menlo,Consolas,monospace; font-size: 12.5px; color: #c0392b; }
+  pre { background: #1e1e2e; color: #cdd6f4; padding: 14px 18px;
+        border-radius: 8px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .box { border-left: 5px solid; border-radius: 6px; padding: 12px 16px; margin: 14px 0; font-size: 14px; }
+  .key  { background: var(--key-bg);  border-color: var(--key-border); }
+  .warn { background: var(--warn-bg); border-color: var(--warn-border); }
+  .ok { background: var(--ok-bg); border-color: var(--ok-border); }
+  .box b:first-child { display: block; margin-bottom: 4px; }
+  .toc { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 16px 26px; margin: 20px 0; }
+  .toc a { color: #2e86c1; text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AWS CLI 安装配置与研发组交接指南</h1>
+  <div class="sub">SRE → 研发组 云平台工作交接 · p5en H200 推理项目 · 覆盖 CLI 安装 / IAM 用户与权限 / 常用操作 / 交接清单</div>
+</header>
+<div class="container">
+
+<div class="toc"><b>目录</b>
+<ol>
+<li><a href="#s1">安装 AWS CLI 与 SSM 插件（研发组每人一次）</a></li>
+<li><a href="#s2">创建研发组 IAM 用户与授权（SRE 操作一次）</a></li>
+<li><a href="#s3">配置 CLI 凭证与验证（研发组）</a></li>
+<li><a href="#s4">研发组日常操作速查</a></li>
+<li><a href="#s5">交接清单（SRE 填写后连同本文档一起移交）</a></li>
+</ol>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s1">1. 安装 AWS CLI 与 SSM 插件</h2>
+
+<h3>1.1 macOS</h3>
+<pre><code># 方式一: Homebrew（推荐）
+brew install awscli
+brew install --cask session-manager-plugin
+
+# 方式二: 官方 pkg（无 brew 时）
+curl -o AWSCLIV2.pkg "https://awscli.amazonaws.com/AWSCLIV2.pkg"
+sudo installer -pkg AWSCLIV2.pkg -target /
+# SSM 插件 (Apple Silicon; Intel 把 mac_arm64 换成 mac):
+curl -o smp.pkg "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/session-manager-plugin.pkg"
+sudo installer -pkg smp.pkg -target /
+sudo ln -sf /usr/local/sessionmanagerplugin/bin/session-manager-plugin /usr/local/bin/</code></pre>
+
+<h3>1.2 Linux (x86_64)</h3>
+<pre><code>curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+unzip -q awscliv2.zip && sudo ./aws/install
+# SSM 插件 (Ubuntu/Debian):
+curl -o smp.deb "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+sudo dpkg -i smp.deb
+# (AL2023/RHEL 系: 把 ubuntu_64bit/...deb 换成 linux_64bit/session-manager-plugin.rpm, 用 dnf install)</code></pre>
+
+<h3>1.3 Windows</h3>
+<p>下载并运行两个 MSI：
+<code>https://awscli.amazonaws.com/AWSCLIV2.msi</code> 与
+<code>https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe</code></p>
+
+<h3>1.4 验证</h3>
+<pre><code>aws --version                       # aws-cli/2.x
+session-manager-plugin --version    # 1.2.x</code></pre>
+
+<!-- ================================================================ -->
+<h2 id="s2">2. 创建研发组 IAM 用户与授权（SRE 操作）</h2>
+
+<div class="box key">
+<b>&#128273; 权限方案：一个托管策略 = PowerUserAccess</b>
+AWS 托管策略 <code>PowerUserAccess</code>（<code>arn:aws:iam::aws:policy/PowerUserAccess</code>）
+就是"研发最大权限"的标准答案：<b>除 IAM/Organizations 账号管理外的全部服务操作全开</b>
+（EC2/S3/SSM/ECR/Bedrock/CloudWatch…），完全覆盖研发的日常工作
+（登节点/调试/查容量/读写模型桶）。集群开机（CloudFormation 建栈，涉及创建 IAM 角色）
+保留在 SRE 职责内，研发无需额外 IAM 权限。
+</div>
+
+<h3>2.1 创建用户组与用户（控制台或 CLI 均可，以下为 CLI）</h3>
+<pre><code># 1. 建组并挂 PowerUserAccess
+aws iam create-group --group-name h200-dev
+aws iam attach-group-policy --group-name h200-dev \
+  --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+
+# 2. 建用户入组（每个研发一个, 不要共享账号）
+aws iam create-user --user-name dev-zhangsan
+aws iam add-user-to-group --group-name h200-dev --user-name dev-zhangsan
+
+# 3a. CLI 访问密钥（只显示一次, 安全传递给本人）
+aws iam create-access-key --user-name dev-zhangsan
+
+# 3b. 控制台密码（可选, 首登强制改密）
+aws iam create-login-profile --user-name dev-zhangsan \
+  --password '&lt;临时密码&gt;' --password-reset-required</code></pre>
+
+<div class="box warn">
+<b>&#9888;&#65039; 安全底线（SRE 交接前确认）</b>
+① 每人独立用户，<b>建议不共享 AK</b>；② 控制台登录建议开 MFA；③ AK 定期轮换；
+④ 账单/成本查看如需要，另加 <code>AWSBillingReadOnlyAccess</code>。
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s3">3. 配置 CLI 凭证与验证（研发组）</h2>
+
+<pre><code>aws configure
+# AWS Access Key ID:     &lt;发给你的 AK&gt;
+# AWS Secret Access Key: &lt;发给你的 SK&gt;
+# Default region name:   us-west-2        ← 本项目主区域
+# Default output format: json
+
+# 验证身份与权限:
+aws sts get-caller-identity                       # 应显示你的 user ARN
+aws ec2 describe-instances --region us-west-2 \
+  --query 'Reservations[].Instances[].InstanceId' # 能列出实例 = EC2 权限 OK
+aws s3 ls                                          # 能列桶 = S3 权限 OK</code></pre>
+
+<p>多区域/多身份可用 profile：<code>aws configure --profile use2</code>，
+使用时 <code>aws ... --profile use2</code> 或 <code>export AWS_PROFILE=use2</code>。</p>
+
+<!-- ================================================================ -->
+<h2 id="s4">4. 研发组日常操作速查</h2>
+
+<h3>4.1 登录 GPU 节点（私有子网，全部走 SSM，无需 VPN/跳板机/开 22 端口）</h3>
+<pre><code># 交互 shell:
+aws ssm start-session --target i-xxxx --region us-west-2
+
+# SSH/scp/VSCode Remote（需节点上已有你的公钥, 开机时 KeyName 参数注入）~/.ssh/config:
+Host gpu-*
+  User ec2-user
+  ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=22
+# 用法: ssh gpu-i-xxxx
+
+# 端口转发调试推理服务（本地 curl localhost:8000 直达节点 router）:
+aws ssm start-session --target i-xxxx --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
+
+# 批量对多节点执行命令:
+aws ssm send-command --instance-ids i-a i-b --document-name AWS-RunShellScript \
+  --parameters 'commands=["nvidia-smi -L"]' --region us-west-2</code></pre>
+
+<h3>4.2 查看 CB 容量 / 模型权重</h3>
+<pre><code>aws ec2 describe-capacity-reservations --region us-west-2 \
+  --query 'CapacityReservations[?ReservationType==`capacity-block`].{id:CapacityReservationId,state:State,az:AvailabilityZone,n:TotalInstanceCount,end:EndDate}' --output table
+aws s3 ls s3://&lt;模型桶&gt;/models/</code></pre>
+
+<!-- ================================================================ -->
+<h2 id="s5">5. 交接清单（SRE 填写）</h2>
+
+<table>
+<tr><th>项</th><th>值（SRE 填写）</th><th>说明</th></tr>
+<tr><td>AWS 账号 ID</td><td></td><td></td></tr>
+<tr><td>主区域 / 备区域</td><td>us-west-2 / us-east-2</td><td>CB 供给可能跨区轮换</td></tr>
+<tr><td>研发 IAM 组 / 用户列表</td><td>h200-dev / </td><td>PowerUserAccess</td></tr>
+<tr><td>VPC / 节点子网（私有+NAT）</td><td></td><td>p5en 开机拿不到公网 IP，必须 NAT 出网</td></tr>
+<tr><td>NAT Gateway / S3 Endpoint</td><td></td><td>权重流量走 S3 Gateway Endpoint 省费</td></tr>
+<tr><td>当前 CB（cr-id / 到期时间）</td><td></td><td><b>到期前必打 golden AMI</b></td></tr>
+<tr><td>集群 CFN 栈名 / 模板位置</td><td></td><td></td></tr>
+<tr><td>golden AMI ID</td><td></td><td>含 mdadm/EFA/推理镜像</td></tr>
+<tr><td>模型权重 S3 桶</td><td></td><td></td></tr>
+<tr><td>SSH KeyPair 名</td><td></td><td>CFN KeyName 参数用</td></tr>
+<tr><td>部署文档仓库（GitHub）</td><td></td><td>部署指引/踩坑记录/manifests</td></tr>
+</table>
+
+<div class="box ok">
+<b>&#9989; 交接完成标准</b>
+研发组每人：CLI 装好 → <code>aws sts get-caller-identity</code> 通过 →
+能 SSM 登进任一 GPU 节点 → 能读模型 S3 桶。四步全过即交接完成，
+后续按部署主文档（p5en-inference-deployment.html）和 SKILL.md 独立作业。
+</div>
+
+<footer style="color:#888;font-size:12px;margin-top:60px;border-top:1px solid var(--border);padding-top:14px">
+配套文档: p5en-inference-deployment.html（部署主文档）· userdata-explained.html（节点开机说明）·
+skills/www/SKILL.md §4.1（私有子网 SSM 调试详解）
+</footer>
+</div>
+</body>
+</html>

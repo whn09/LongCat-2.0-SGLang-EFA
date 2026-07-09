@@ -1,0 +1,218 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: torchrun-training-script
+  namespace: default
+data:
+  train.py: |
+    import os
+    import argparse
+    import torch
+    import torch.distributed as dist
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data import DataLoader, DistributedSampler
+    from torchvision import datasets, transforms
+
+    def setup():
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        print(f"Rank {rank}/{world_size} (local_rank={local_rank}) initialized on {os.environ.get('HOSTNAME', 'unknown')}")
+        return rank, world_size, local_rank
+
+    def cleanup():
+        dist.destroy_process_group()
+
+    class SimpleNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Sequential(
+                nn.Linear(784, 256),
+                nn.ReLU(),
+                nn.Linear(256, 10),
+            )
+
+        def forward(self, x):
+            return self.fc(x.view(x.size(0), -1))
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--epochs", type=int, default=5)
+        parser.add_argument("--batch-size", type=int, default=64)
+        args = parser.parse_args()
+
+        rank, world_size, local_rank = setup()
+        device = torch.device(f"cuda:{local_rank}")
+
+        model = SimpleNet().to(device)
+        model = DDP(model, device_ids=[local_rank])
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+
+        dataset = datasets.FakeData(size=1000, image_size=(1, 28, 28), num_classes=10, transform=transforms.ToTensor())
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
+
+        for epoch in range(args.epochs):
+            sampler.set_epoch(epoch)
+            total_loss = 0.0
+            for data, target in loader:
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            if rank == 0:
+                print(f"Epoch {epoch+1}/{args.epochs}, Loss: {total_loss / len(loader):.4f}")
+
+        cleanup()
+        if rank == 0:
+            print("Training complete!")
+
+    if __name__ == "__main__":
+        main()
+---
+# PyTorchJob: 2-node distributed training with torchrun + c10d elastic rendezvous.
+#
+# Kubeflow Training Operator auto-injects into each pod:
+#   MASTER_ADDR  — Master pod hostname (resolved via headless Service)
+#   MASTER_PORT  — 23456 (from containerPort named pytorchjob-port)
+#   WORLD_SIZE   — 2 (1 Master + 1 Worker)
+#   RANK         — 0 (Master) or 1 (Worker)
+#
+# torchrun uses --rdzv-backend=c10d with these env vars for elastic
+# rendezvous. No manual --node-rank needed.
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: torchrun-distributed-g7e
+  namespace: default
+spec:
+  nprocPerNode: "8"
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app: torchrun-g7e
+            role: master
+        spec:
+          containers:
+            - name: pytorch
+              image: public.ecr.aws/deep-learning-containers/sglang:0.5.8-gpu-py312-cu129-ubuntu24.04-sagemaker-v1.11-soci
+              imagePullPolicy: IfNotPresent
+              command:
+                - torchrun
+              args:
+                - --nnodes=2
+                - --nproc-per-node=8
+                - --rdzv-backend=c10d
+                - --rdzv-endpoint=$(MASTER_ADDR):$(MASTER_PORT)
+                - /workspace/train.py
+              env:
+                # NCCL_SOCKET_IFNAME must be eth0 inside K8s pods (Flannel CNI),
+                # NOT the host interface name (e.g., enp*).
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_NET_PLUGIN
+                  value: "libnccl-net-ofi.so"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: NCCL_PROTO
+                  value: "Simple"
+              ports:
+                - name: pytorchjob-port
+                  containerPort: 23456
+              resources:
+                requests:
+                  cpu: "180"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "4"
+                limits:
+                  cpu: "180"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "4"
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: training-scripts
+                  mountPath: /workspace
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 256Gi
+            - name: training-scripts
+              configMap:
+                name: torchrun-training-script
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app: torchrun-g7e
+            role: worker
+        spec:
+          containers:
+            - name: pytorch
+              image: public.ecr.aws/deep-learning-containers/sglang:0.5.8-gpu-py312-cu129-ubuntu24.04-sagemaker-v1.11-soci
+              imagePullPolicy: IfNotPresent
+              command:
+                - torchrun
+              args:
+                - --nnodes=2
+                - --nproc-per-node=8
+                - --rdzv-backend=c10d
+                - --rdzv-endpoint=$(MASTER_ADDR):$(MASTER_PORT)
+                - /workspace/train.py
+              env:
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_NET_PLUGIN
+                  value: "libnccl-net-ofi.so"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: NCCL_PROTO
+                  value: "Simple"
+              ports:
+                - name: pytorchjob-port
+                  containerPort: 23456
+              resources:
+                requests:
+                  cpu: "180"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "4"
+                limits:
+                  cpu: "180"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "4"
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: training-scripts
+                  mountPath: /workspace
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 256Gi
+            - name: training-scripts
+              configMap:
+                name: torchrun-training-script

@@ -1,0 +1,25 @@
+# 复制为 terraform.tfvars 后填写
+region                  = "us-east-2"
+cluster_name            = "p5en-inference"
+vpc_id                  = "vpc-xxxxxxxxxxxxxxxxx"
+subnet_id               = "subnet-xxxxxxxxxxxxxxxxx" # 必须与 CB 预留同 AZ
+capacity_reservation_id = "cr-xxxxxxxxxxxxxxxxx"
+
+# 2P2D 测试先开 4 台, 全量 12 台(4P+8D)按 CB 实际预留数量调整
+instance_count = 8
+
+# AL2023 Base DLAMI (含 NVIDIA driver + EFA + Docker), 用 SSM 查最新:
+# aws ssm get-parameter --region us-east-2 \
+#   --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-amazon-linux-2023/latest/ami-id \
+#   --query Parameter.Value --output text
+ami_id = "ami-xxxxxxxxxxxxxxxxx"
+
+key_name         = "my-keypair"
+allowed_ssh_cidr = "10.0.0.0/8"
+
+root_volume_size       = 1024
+data_volume_size       = 2048
+data_volume_iops       = 16000
+data_volume_throughput = 1000
+
+efa_installer_version = "1.48.0"

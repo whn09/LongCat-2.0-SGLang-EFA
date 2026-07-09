@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-efa-k8s-device-plugin
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: aws-efa-k8s-device-plugin
+  template:
+    metadata:
+      labels:
+        name: aws-efa-k8s-device-plugin
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      containers:
+        - name: aws-efa-k8s-device-plugin
+          # This image requires ECR auth. Pre-pull via Docker and import to containerd:
+          #   aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 602401143452.dkr.ecr.us-west-2.amazonaws.com
+          #   docker pull 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/aws-efa-k8s-device-plugin:v0.5.7
+          #   docker save <image> | sudo ctr -n k8s.io images import -
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/aws-efa-k8s-device-plugin:v0.5.7
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: infiniband-devices
+              mountPath: /dev/infiniband
+            - name: sys
+              mountPath: /sys
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: infiniband-devices
+          hostPath:
+            path: /dev/infiniband
+        - name: sys
+          hostPath:
+            path: /sys

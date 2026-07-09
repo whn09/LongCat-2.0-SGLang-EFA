@@ -1,0 +1,1238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>p5en.48xlarge 自建 K8s 推理系统部署文档（SGLang PD 分离 + EFA）</title>
+<style>
+  :root {
+    --primary: #232f3e; --accent: #ff9900; --bg: #fafafa;
+    --code-bg: #1e1e2e; --code-fg: #cdd6f4; --border: #d5d9dd;
+    --warn-bg: #fff8e6; --warn-border: #f0ad4e;
+    --key-bg: #e8f4fd; --key-border: #2e86c1;
+    --danger-bg: #fdecea; --danger-border: #e74c3c;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+         margin: 0; background: var(--bg); color: #222; line-height: 1.7; }
+  .container { max-width: 1080px; margin: 0 auto; padding: 24px 32px 80px; }
+  header { background: var(--primary); color: #fff; padding: 36px 32px; }
+  header h1 { margin: 0 0 8px; font-size: 26px; }
+  header .sub { color: #ccc; font-size: 14px; }
+  h2 { color: var(--primary); border-bottom: 3px solid var(--accent);
+       padding-bottom: 6px; margin-top: 48px; font-size: 22px; }
+  h3 { color: var(--primary); margin-top: 32px; font-size: 18px; }
+  h4 { color: #444; margin-top: 24px; font-size: 15px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13.5px; background:#fff; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--primary); color: #fff; font-weight: 600; }
+  tr:nth-child(even) { background: #f4f6f8; }
+  code { background: #eef0f3; padding: 1px 6px; border-radius: 4px;
+         font-family: "SF Mono",Menlo,Consolas,monospace; font-size: 12.5px; color: #c0392b; }
+  pre { background: var(--code-bg); color: var(--code-fg); padding: 16px 20px;
+        border-radius: 8px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; }
+  pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+  .box { border-left: 5px solid; border-radius: 6px; padding: 14px 18px; margin: 18px 0; font-size: 14px; }
+  .key   { background: var(--key-bg);   border-color: var(--key-border); }
+  .warn  { background: var(--warn-bg);  border-color: var(--warn-border); }
+  .danger{ background: var(--danger-bg);border-color: var(--danger-border); }
+  .box b:first-child { display: block; margin-bottom: 6px; }
+  .toc { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 20px 28px; margin: 24px 0; }
+  .toc ol { margin: 8px 0; padding-left: 22px; }
+  .toc a { color: #2e86c1; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .step-num { display:inline-block; background: var(--accent); color:#fff; border-radius: 50%;
+              width: 26px; height: 26px; text-align:center; line-height:26px; font-weight:bold; margin-right:8px; }
+  .arch { background:#fff; border:1px solid var(--border); border-radius:8px; padding:16px; overflow-x:auto; }
+  .arch pre { background:#fff; color:#333; margin:0; }
+  .tag { display:inline-block; background:var(--accent); color:#fff; border-radius:4px;
+         padding:0 8px; font-size:12px; margin-right:6px; }
+  footer { color:#888; font-size:12px; margin-top:60px; border-top:1px solid var(--border); padding-top:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>p5en.48xlarge 自建 K8s 推理系统部署文档</h1>
+  <div class="sub">SGLang PD 分离（Prefill/Decode Disaggregation）· Mooncake KV Transfer · UCCL-EP MoE all-to-all · 16× EFA · Capacity Block 批量开机 · 2026-07</div>
+</header>
+<div class="container">
+
+<!-- ================================================================ -->
+<!-- 概要说明 -->
+<!-- ================================================================ -->
+<h2 id="summary">0. 概要说明（Executive Summary）</h2>
+
+<p>本文档面向在 AWS <b>p5en.48xlarge</b>（8× NVIDIA H200 141GB，16× EFA，共 3200 Gbps）上，
+通过 <b>Capacity Block（CB）一次开 8 台</b>、使用<b>自建 Kubernetes（非 EKS）</b>构建 SGLang PD 分离推理系统的客户。</p>
+
+<h3>0.1 目标拓扑</h3>
+<table>
+  <tr><th>角色</th><th>GPU 数</th><th>节点数</th><th>并行策略</th><th>DeepEP 模式</th></tr>
+  <tr><td><b>Prefill</b></td><td>32 卡</td><td>4× p5en</td><td>pp4 / tp8 / ep32</td><td>normal（大 batch 吞吐优先）</td></tr>
+  <tr><td><b>Decode</b></td><td>64 卡</td><td>8× p5en</td><td>dp64 / ep64</td><td>low_latency（逐 token 延迟优先）</td></tr>
+</table>
+
+<div class="box key">
+<b>&#9989; 验证路径：先 2P2D 验证部署，再切换到 4P8D 目标部署方案</b>
+先用 4 台机器跑 <b>2 Prefill 节点 + 2 Decode 节点</b>（本文第二部分第 8 章给出完整启动命令），
+验证 EFA / Mooncake KV 传输 / UCCL-EP all-to-all 三条链路全部打通后，切换到目标 4P + 8D 方案。
+<br><br>
+<b>注意：2P2D → 4P8D 不是简单扩容，而是部署方案的切换</b>——两者并行策略完全不同
+（Prefill pp2→pp4，Decode tp16/dp16→tp64/dp64），意味着权重切分方式、KV pool 布局、
+JIT 编译缓存全部改变，需要修改启动参数并对全部 P/D 服务做停服重新部署（见 §9）。
+<b>可以复用的是基础设施层</b>：启动模板 / 安全组 / placement group / 镜像 / AMI 从第一天起
+按最终规模设计，两套方案通用，切换时只增加实例数量。
+</div>
+
+<h3>0.2 关键步骤清单</h3>
+<table>
+  <tr><th style="width:60px">步骤</th><th>内容</th><th>对应章节</th></tr>
+  <tr><td>1</td><td>购买 Capacity Block，记录 <code>cr-xxxx</code> 预留 ID 与 AZ</td><td>§1.1</td></tr>
+  <tr><td>2</td><td>准备 VPC / 单 AZ 私有子网 / AL2023 DLAMI AMI ID</td><td>§1.2</td></tr>
+  <tr><td>3</td><td>用 Terraform <b>或</b> CloudFormation 一键开机（LT 内嵌 CB 参数 + 16× EFA 网卡 + 1TB 根盘 + 2TB 数据盘 + userdata 自动配置 RAID0）</td><td>§2 / §3</td></tr>
+  <tr><td>4</td><td>开机后验证：GPU / EFA 设备 / 磁盘挂载 / 实例拓扑</td><td>§4</td></tr>
+  <tr><td>4.5</td><td><b>固化自定义 AMI</b>：环境配好后打镜像，CB 到期换块后分钟级重建</td><td>§4.5</td></tr>
+  <tr><td>5</td><td>构建（或直接拉取）推理容器镜像：SGLang + Mooncake TE + UCCL-EP，集成 EFA 适配</td><td>§5</td></tr>
+  <tr><td>6</td><td>自建 K8s：kubeadm 初始化 + CNI + NVIDIA / EFA device plugin</td><td>§6</td></tr>
+  <tr><td>7</td><td>模型权重分发到本地 NVMe（<code>/mnt/nvme</code>）</td><td>§7</td></tr>
+  <tr><td>8</td><td>2P2D 部署验证（Prefill tp8/pp2 + Decode tp16/dp16 + Router）</td><td>§8</td></tr>
+  <tr><td>9</td><td>切换到 4P8D 目标部署方案（pp4/tp8/ep32 + dp64/ep64，并行策略全变，停服重部署）</td><td>§9</td></tr>
+  <tr><td>10</td><td>压测与排障</td><td>§10</td></tr>
+</table>
+
+<h3>0.3 技术栈与数据通路</h3>
+<div class="arch"><pre>
+                          客户端请求
+                              |
+                              v
+                    +--------------------+
+                    |   sglang_router    |  --pd-disaggregation
+                    |     (port 8000)    |
+                    +----+----------+----+
+                         |          |
+              +----------v--+    +--v-----------+
+              | Prefill 集群 |    | Decode 集群  |
+              +------+------+    +------+-------+
+                     |    KV cache      |
+                     +--- Mooncake TE --+       &lt;-- EFA RDMA (SRD)
+                          (protocol=efa)
+
+  三条独立通信链路（全部跑在 16× EFA 上）:
+  ① MoE all-to-all : sglang --moe-a2a-backend deepep -&gt; deep_ep(UCCL wrapper) -&gt; uccl.ep -&gt; EFA
+  ② KV 传输        : sglang --disaggregation-transfer-backend mooncake -&gt; Mooncake TE(USE_EFA=ON) -&gt; EFA
+  ③ TP/DP 集合通信 : torch.distributed(NCCL) -&gt; NVLink(机内) + aws-ofi-nccl(跨机 EFA)
+</pre></div>
+
+<table>
+  <tr><th>组件</th><th>版本 / 来源</th><th>说明</th></tr>
+  <tr><td>基础 AMI</td><td>AL2023 Base Deep Learning AMI</td><td>含 NVIDIA driver、EFA 内核模块、Docker</td></tr>
+  <tr><td>推理镜像</td><td><code>public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl</code></td><td>由 <code>Dockerfile.customer-h200</code> 构建（KevinZhao/efa-validation）</td></tr>
+  <tr><td>SGLang</td><td>0.5.10</td><td>已内置 rdma→efa 协议补丁</td></tr>
+  <tr><td>Mooncake TE</td><td>v0.3.11.post1</td><td>USE_EFA=ON；含 PR #2023 DP&gt;1 根因修复（大 DP 必须）</td></tr>
+  <tr><td>UCCL-EP</td><td>@8ac850bd + deep_ep wrapper</td><td>EFA 上的 DeepEP 替代（EFA 不支持 IBGDA，原生 DeepEP 不可用）</td></tr>
+  <tr><td>EFA installer</td><td>1.48.0</td><td>libfabric + SRD provider</td></tr>
+  <tr><td>NCCL 插件</td><td>aws-ofi-nccl v1.19.0</td><td>NCCL 跨机走 EFA</td></tr>
+  <tr><td>Kubernetes</td><td>v1.31（kubeadm 自建）</td><td>NVIDIA device plugin v0.17.1 + AWS EFA device plugin v0.5.7</td></tr>
+</table>
+
+<div class="box warn">
+<b>&#9888;&#65039; 三个全局硬性约束（违反任何一条集群都跑不起来）</b>
+<ul style="margin:4px 0">
+<li><b>单 AZ</b>：所有节点必须在同一 AZ（CB 预留本身绑定 AZ；PD 分离跨 AZ 会直接挂）。</li>
+<li><b>安全组自引用全通</b>：EFA 要求安全组对自身开放全部入站 + 出站流量，缺 egress 自引用规则 EFA 无法通信。</li>
+<li><b>模型权重放本地 NVMe</b>：从 S3 拉到 <code>/mnt/nvme</code>（RAID0），<code>--model-path</code> 只指本地路径。不要用 FSx 跨 AZ 共享或 HuggingFace 直拉。</li>
+</ul>
+</div>
+
+<div class="toc">
+<b>目录</b>
+<ol>
+  <li><a href="#part1">第一部分：EC2 虚拟机开机与配置</a>
+    <ol>
+      <li><a href="#s1">前置准备（CB 购买 / 网络 / AMI）</a></li>
+      <li><a href="#s2">方案 A：Terraform 开机</a></li>
+      <li><a href="#s3">方案 B：CloudFormation 开机</a></li>
+      <li><a href="#s4">开机后验证</a></li>
+      <li style="list-style:none"><a href="#s4b">4.5 固化自定义 AMI：CB 换块后快速开机</a></li>
+      <li style="list-style:none"><a href="#s4c">4.7 磁盘方案设计边界与竞态知识（知识沉淀）</a></li>
+    </ol>
+  </li>
+  <li><a href="#part2">第二部分：容器镜像与自建 K8s 环境（EFA 适配）</a>
+    <ol start="5">
+      <li><a href="#s5">推理容器镜像</a></li>
+      <li><a href="#s6">自建 Kubernetes 集群</a></li>
+      <li><a href="#s7">模型权重分发</a></li>
+      <li><a href="#s8">2P2D 部署验证</a></li>
+      <li><a href="#s9">切换到 4P8D 目标部署方案</a></li>
+      <li><a href="#s10">压测与排障速查</a></li>
+    </ol>
+  </li>
+</ol>
+</div>
+
+<!-- ================================================================ -->
+<!-- 第一部分 -->
+<!-- ================================================================ -->
+<h2 id="part1" style="background:var(--primary);color:#fff;padding:12px 20px;border:none;border-radius:6px">第一部分：EC2 虚拟机开机与配置</h2>
+
+<div class="box key">
+<b>&#128273; 本部分重要配置（开机前必读）</b>
+<table style="margin:8px 0">
+<tr><th>配置项</th><th>值</th><th>为什么</th></tr>
+<tr><td>购买方式</td><td>Capacity Block（LT 内嵌 <code>market_type=capacity-block</code> + <code>capacity_reservation_id</code>）</td><td>CB 要求两项都写入启动模板，缺一开机报错</td></tr>
+<tr><td>网卡布局</td><td><b>17 个接口</b> = 1× <code>interface</code>（纯 ENA 主网卡）+ <b>16×</b> <code>efa-only</code></td><td>AWS 官方推荐配置；主网卡不能是 efa-only；efa-only 不占子网 IP，只跑 RDMA</td></tr>
+<tr><td>NetworkCardIndex / DeviceIndex</td><td>主网卡 (card 0, dev 0)；EFA 为 <b>(card 0, dev 1)</b> + (card 1..15, dev 0)</td><td><b>card 0 有两个接口</b>——dev 1 的 EFA 容易漏掉，漏了只有 15 个 EFA 设备</td></tr>
+<tr><td>根盘</td><td>1024 GiB gp3 加密</td><td>容器镜像层（推理镜像 11-12GB，解压后更大）+ 系统</td></tr>
+<tr><td>数据盘</td><td>2048 GiB gp3，<b>16000 IOPS / 1000 MBps</b> 加密</td><td>模型/日志持久化；gp3 默认 3000/125 对权重分发太慢，直接拉满</td></tr>
+<tr><td>本地盘</td><td>8× 3.5TB NVMe 实例存储 → RAID0 → <code>/mnt/nvme</code>（userdata 自动）</td><td>模型权重加载路径；~28TB，条带化读带宽最高</td></tr>
+<tr><td>Placement Group</td><td>cluster 策略</td><td>EFA 低延迟要求同机架邻近</td></tr>
+<tr><td>安全组</td><td>自引用 all-traffic ingress <b>+ egress</b></td><td>EFA 官方硬性要求</td></tr>
+<tr><td>IMDS</td><td><code>http_tokens=required</code>, <code>hop_limit=2</code></td><td>IMDSv2；hop=2 允许容器内访问实例元数据</td></tr>
+</table>
+</div>
+
+<h3 id="s1"><span class="step-num">1</span>前置准备</h3>
+
+<h4>1.1 购买 Capacity Block</h4>
+<pre><code># 1. 搜索可用的 CB 时段（8 台 p5en，按需调 duration）
+aws ec2 describe-capacity-block-offerings \
+  --region us-east-2 \
+  --instance-type p5en.48xlarge \
+  --instance-count 8 \
+  --capacity-duration-hours 168 \
+  --output table
+
+# 2. 购买（用上一步返回的 CapacityBlockOfferingId）
+aws ec2 purchase-capacity-block \
+  --region us-east-2 \
+  --capacity-block-offering-id cbo-xxxxxxxxxxxx \
+  --instance-platform Linux/UNIX
+
+# 3. 查看预留 ID（cr-xxxx）与 AZ —— 后续开机脚本需要
+aws ec2 describe-capacity-reservations \
+  --region us-east-2 \
+  --filters Name=instance-type,Values=p5en.48xlarge \
+  --query 'CapacityReservations[].{id:CapacityReservationId,az:AvailabilityZone,state:State,start:StartDate,count:TotalInstanceCount}' \
+  --output table</code></pre>
+
+<div class="box warn">
+<b>&#9888;&#65039; CB 注意事项</b>
+<ul style="margin:4px 0">
+<li>CB 预留有<b>固定起止时间</b>，开始前无法开机；到期时实例被自动回收——因此本文用固定数量的 EC2 实例而非 ASG（ASG 会在回收后徒劳补机报错）。</li>
+<li>子网必须在 CB 预留的 AZ 内，跨 AZ 开机直接失败。</li>
+<li>2P2D 测试阶段可只开 4 台（Terraform 改 <code>instance_count=4</code> / CFN 改 <code>InstanceCount=4</code>），CB 内未用容量保持可用，扩容时把参数改回 8 再 apply 即可。</li>
+</ul>
+</div>
+
+<h4>1.2 查询 AL2023 Deep Learning AMI</h4>
+<p>基础镜像使用 <b>AL2023 Base Deep Learning AMI</b>（含 NVIDIA 驱动、EFA 内核模块、Docker、nvidia-container-toolkit）：</p>
+<pre><code>aws ssm get-parameter --region us-east-2 \
+  --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-amazon-linux-2023/latest/ami-id \
+  --query 'Parameter.Value' --output text</code></pre>
+<p>记录返回的 <code>ami-xxxx</code>，填入 Terraform/CloudFormation 参数。</p>
+
+<h4>1.3 网络前提</h4>
+<ul>
+<li>一个 VPC + 一个与 CB 同 AZ 的<b>私有子网</b>（子网可用 IP ≥ 32：每台实例主网卡占 1 个 IP，efa-only 网卡不占 IP）。</li>
+<li>私有子网需具备出网能力（NAT Gateway 或 VPC Endpoints），用于拉取 EFA installer、容器镜像、K8s 软件源。</li>
+<li>准备一台堡垒机（或使用 SSM Session Manager——节点 IAM 角色已含 <code>AmazonSSMManagedInstanceCore</code>，可免 SSH 直连）。</li>
+</ul>
+
+<h3 id="s2"><span class="step-num">2</span>方案 A：Terraform 开机（推荐）</h3>
+
+<p>完整脚本随本文档交付于 <code>terraform/</code> 目录（<code>main.tf</code> / <code>variables.tf</code> / <code>userdata.sh.tpl</code> / <code>outputs.tf</code> / <code>terraform.tfvars.example</code>），
+结构参考 <a href="https://github.com/aws-samples/sample-eks-enterprise-quickstart">aws-samples/sample-eks-enterprise-quickstart</a> 的
+<code>terraform/modules/eks-gpu-nodegroup</code>（该模块中 p5en.48xlarge 的 EFA 布局定义为 <code>efa_only_count=15, primary_efa=true</code>）。</p>
+
+<h4>2.1 使用方法</h4>
+<pre><code>cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# 编辑 terraform.tfvars: 填 region / vpc_id / subnet_id / capacity_reservation_id / ami_id
+#   2P2D 测试: instance_count = 4
+#   全量:      instance_count = 8
+
+terraform init
+terraform plan
+terraform apply
+
+# 输出所有节点私有 IP
+terraform output private_ips</code></pre>
+
+<h4>2.2 核心资源清单（main.tf）</h4>
+<table>
+<tr><th>资源</th><th>要点</th></tr>
+<tr><td><code>aws_launch_template.p5en</code></td><td>CB 双要素（<code>instance_market_options.market_type=capacity-block</code> + <code>capacity_reservation_target</code>）、16 网卡 dynamic block、双盘、userdata</td></tr>
+<tr><td><code>aws_placement_group.cluster</code></td><td>cluster 策略</td></tr>
+<tr><td><code>aws_security_group.node</code> + 4 条规则</td><td>自引用 ingress/egress all + 出网 + 可选 SSH</td></tr>
+<tr><td><code>aws_iam_role.node</code></td><td>SSM + ECR ReadOnly + EKS_CNI_Policy（后续 VPC CNI 需要 ENI 权限）</td></tr>
+<tr><td><code>aws_instance.p5en[count]</code></td><td>固定数量直开，不用 ASG（CB 到期回收后 ASG 补机只会报错）</td></tr>
+</table>
+
+<h4>2.3 启动模板关键片段（节选自 main.tf，完整见文件）</h4>
+<pre><code>resource "aws_launch_template" "p5en" {
+  image_id      = var.ami_id
+  instance_type = "p5en.48xlarge"        # CB 要求 InstanceType 写入 LT
+
+  instance_market_options { market_type = "capacity-block" }
+  capacity_reservation_specification {
+    capacity_reservation_target {
+      capacity_reservation_id = var.capacity_reservation_id
+    }
+  }
+  placement { group_name = aws_placement_group.cluster.name }
+
+  # 根盘 1TB gp3
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs { volume_size = 1024  volume_type = "gp3"  encrypted = true }
+  }
+  # 数据盘 2TB gp3 拉满 IOPS/吞吐
+  block_device_mappings {
+    device_name = "/dev/xvdb"
+    ebs { volume_size = 2048  volume_type = "gp3"
+          iops = 16000  throughput = 1000  encrypted = true }
+  }
+
+  # 主网卡: card 0 / device 0, 纯 ENA（官方要求主网卡不能是 efa-only）
+  network_interfaces {
+    network_card_index = 0
+    device_index       = 0
+    interface_type     = "interface"
+    subnet_id          = var.subnet_id
+    security_groups    = [aws_security_group.node.id]
+  }
+  # card 0 / device 1: EFA-only —— 容易漏掉的一个! card 0 同样承载 EFA
+  network_interfaces {
+    network_card_index = 0
+    device_index       = 1
+    interface_type     = "efa-only"
+    subnet_id          = var.subnet_id
+    security_groups    = [aws_security_group.node.id]
+  }
+  # card 1..15 / device 0: EFA-only x15, 合计 16 个 EFA 设备
+  dynamic "network_interfaces" {
+    for_each = range(1, 16)
+    content {
+      network_card_index = network_interfaces.value
+      device_index       = 0
+      interface_type     = "efa-only"
+      subnet_id          = var.subnet_id
+      security_groups    = [aws_security_group.node.id]
+    }
+  }
+}</code></pre>
+
+<h4>2.4 userdata 做的四件事（userdata.sh.tpl）</h4>
+<table>
+<tr><th>步骤</th><th>动作</th><th>结果</th></tr>
+<tr><td>[1/4]</td><td>按 NVMe 型号 <code>Elastic Block Store</code> 识别 2TB 数据盘（区别于本地盘的 <code>Instance Storage</code> 型号），mkfs.xfs 并写 fstab</td><td><code>/data</code>（含 <code>/data/models /data/logs /data/cache</code>）</td></tr>
+<tr><td>[2/4]</td><td>8× 3.5TB 本地 NVMe 组 mdadm RAID0（chunk 512K）+ ext4，fstab 加 <code>nofail</code>（实例存储重启即失效）</td><td><code>/mnt/nvme</code>（~28TB 高速盘）</td></tr>
+<tr><td>[3/4]</td><td>固定版本安装 EFA userspace（installer 1.48.0，与容器镜像内版本一致）</td><td><code>/opt/amazon/efa</code>，<code>fi_info -p efa</code> 可用</td></tr>
+<tr><td>[4/4]</td><td>确认 nvidia-container-toolkit + Docker；<code>nvidia-smi -pm 1</code> 开启 persistence mode</td><td>容器运行时就绪</td></tr>
+</table>
+
+<div class="box warn">
+<b>&#9888;&#65039; RAID0 数据无冗余、重启丢失</b>
+<code>/mnt/nvme</code> 是实例存储（stop/start 后数据清空），只放<b>可再生数据</b>：模型权重（可从 S3 重拉）、JIT 编译缓存。
+需要持久化的（日志、配置、编译产物备份）放 <code>/data</code>（EBS）。RAID0 拼装逻辑参考 KevinZhao/efa-validation <code>scripts/setup-nvme.sh</code>。
+</div>
+
+<h3 id="s3"><span class="step-num">3</span>方案 B：CloudFormation 开机</h3>
+
+<p>模板交付于 <code>cloudformation/p5en-cb-cluster.yaml</code>，与 Terraform 完全等价（同样的 LT / SG / PG / IAM / userdata），
+适合没有 Terraform 环境、希望在控制台或纯 AWS CLI 操作的场景。已通过 <code>aws cloudformation validate-template</code> 校验。</p>
+
+<h4>3.1 使用方法（CLI）</h4>
+<pre><code>aws cloudformation create-stack \
+  --region us-east-2 \
+  --stack-name p5en-inference \
+  --template-body file://cloudformation/p5en-cb-cluster.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=ClusterName,ParameterValue=p5en-inference \
+    ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+    ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
+    ParameterKey=CapacityReservationId,ParameterValue=cr-xxxxxxxx \
+    ParameterKey=AmiId,ParameterValue=ami-xxxxxxxx \
+    ParameterKey=KeyName,ParameterValue=my-keypair \
+    ParameterKey=InstanceCount,ParameterValue=4 \
+    ParameterKey=AllowedSshCidr,ParameterValue=10.0.0.0/8
+
+# 观察进度
+aws cloudformation wait stack-create-complete --stack-name p5en-inference --region us-east-2
+
+# 取各节点私有 IP
+aws cloudformation describe-stacks --stack-name p5en-inference --region us-east-2 \
+  --query 'Stacks[0].Outputs' --output table</code></pre>
+
+<h4>3.2 参数说明</h4>
+<table>
+<tr><th>参数</th><th>默认值</th><th>说明</th></tr>
+<tr><td><code>InstanceCount</code></td><td>8</td><td>只允许 2/4/6/8（CFN 无 count 语法，用 Condition 分档控制 Node1..Node8）。2P2D 测试用 4</td></tr>
+<tr><td><code>CapacityReservationId</code></td><td>—</td><td>CB 预留 ID（cr-xxxx），必填</td></tr>
+<tr><td><code>SubnetId</code></td><td>—</td><td>必须与 CB 同 AZ</td></tr>
+<tr><td><code>AmiId</code></td><td>—</td><td>§1.2 查询到的 AL2023 DLAMI</td></tr>
+<tr><td><code>RootVolumeSize / DataVolumeSize</code></td><td>1024 / 2048</td><td>GiB</td></tr>
+<tr><td><code>DataVolumeIops / DataVolumeThroughput</code></td><td>16000 / 1000</td><td>gp3 上限</td></tr>
+<tr><td><code>EfaInstallerVersion</code></td><td>1.48.0</td><td>与推理镜像内 EFA 版本对齐</td></tr>
+<tr><td><code>AllowedSshCidr</code></td><td>空</td><td>空则不开 SSH 入口（用 SSM 连接）</td></tr>
+</table>
+
+<div class="box key">
+<b>&#128273; 扩容操作</b>
+2P2D 验证通过后，把 <code>InstanceCount</code> 从 4 改为 8 执行 <code>update-stack</code>（Terraform 则改 <code>instance_count</code> 后
+<code>terraform apply</code>），新节点使用同一启动模板自动完成磁盘/EFA 初始化，加入 K8s 集群只需跑第二部分的 <code>kubeadm join</code>。
+</div>
+
+<h3 id="s4"><span class="step-num">4</span>开机后验证</h3>
+
+<p>对每台节点执行（SSM 或 SSH）：</p>
+<pre><code># 1. GPU: 应显示 8x H200
+nvidia-smi -L
+# 期望: GPU 0: NVIDIA H200 ... (共 8 行)
+
+# 2. EFA 设备: 应显示 16 个 rdmap 设备
+/opt/amazon/efa/bin/fi_info -p efa -l
+ls /sys/class/infiniband/          # rdmapXXs0 x16
+ls /dev/infiniband/                # uverbs0..15
+
+# 3. 磁盘
+df -h /data /mnt/nvme
+# /data     ~2.0T (EBS gp3)
+# /mnt/nvme ~28T  (RAID0 ext4)
+cat /proc/mdstat                   # md0 : active raid0 (8 disks)
+
+# 4. 内核态组件（DLAMI 预装, 确认加载）
+lsmod | grep -E 'nvidia|efa'         # nvidia + efa 内核模块已加载
+modinfo efa | grep ^version          # efa.ko 版本
+nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1
+cat /proc/driver/nvidia/version      # 驱动与 CUDA 兼容性核对
+
+# 5. 引导日志（排查 userdata 问题）
+sudo tail -50 /var/log/p5en-bootstrap.log
+
+# 6. 跨节点 EFA 连通性抽查（node A 上）
+fi_pingpong -p efa &
+# node B 上:
+fi_pingpong -p efa &lt;nodeA私有IP&gt;</code></pre>
+
+<h4>4.6 实例拓扑检查（跨节点通信性能预判）</h4>
+<p>EFA 跨节点延迟与实例在数据中心的物理拓扑相关。用 <code>DescribeInstanceTopology</code> API
+查看各节点的网络层级（NetworkNodes 三层结构），<b>尽量保证 Layer 1 &amp; Layer 2 相同</b>——
+CB + cluster placement group 通常已保证邻近，此检查用于确认：</p>
+<pre><code>aws ec2 describe-instance-topology --region &lt;R&gt; \
+  --filters Name=instance-type,Values=p5en.48xlarge \
+  --query 'Instances[].{id:InstanceId,az:AvailabilityZone,nodes:NetworkNodes}' \
+  --output json
+# NetworkNodes[0](Layer1) 和 [1](Layer2) 相同的实例互访延迟最低。
+# 若个别节点 Layer2 不同, 建议把它安排为 Prefill 节点(计算密集, 网络非瓶颈),
+# Decode 节点间(MoE 小消息累积, 对延迟敏感)优先放拓扑最近的一组。</code></pre>
+
+<div class="box danger">
+<b>&#10060; 常见开机失败</b>
+<ul style="margin:4px 0">
+<li><code>InsufficientInstanceCapacity</code>/<code>InstanceLimitExceeded</code>：CB 未到开始时间、或 <code>cr-id</code>/AZ/实例数与预留不符。</li>
+<li>网卡报错 <code>InterfaceType not supported</code>：子网 AZ 与 p5en 可用区不符，或网卡索引组合不合法（合法组合仅：card0/dev0=interface、card0/dev1=efa-only、card1-15/dev0=efa-only）。</li>
+<li>EFA 设备只有 15 个而非 16：启动模板漏了 <b>card 0 / device 1</b> 的 efa-only 接口。</li>
+<li><code>fi_info</code> 无输出：安全组缺自引用 egress 规则，或 EFA userspace 安装失败（查 bootstrap 日志 [3/4] 段）。</li>
+</ul>
+</div>
+
+<h3 id="s4b"><span class="step-num">4.5</span>固化自定义 AMI：CB 换块后快速开机</h3>
+
+<div class="box key">
+<b>&#128273; 为什么必须打 AMI</b>
+Capacity Block 有<b>固定到期时间，到期实例被自动回收，本地数据全部丢失</b>。
+下一个 CB 块开始时若从原始 DLAMI 重来，每台节点要重复：EFA 安装、K8s 组件安装、
+11-12GB 推理镜像拉取导入、EFA device plugin 镜像导入……单节点耗时 30 分钟以上。
+<b>把配置完成的节点打成自定义 AMI，换 CB 块后用新 AMI 开机，节点分钟级就绪。</b>
+</div>
+
+<h4>4.5.1 打镜像的最佳时机</h4>
+<p>在 <b>§6 K8s 组件安装完成、§5 推理镜像已导入 containerd 之后、kubeadm init/join 之前</b>（或从集群中挑一台已 join 的节点先 <code>kubeadm reset</code> 再打）。这样 AMI 里固化的内容：</p>
+<table>
+<tr><th>已固化（开机即用）</th><th>不固化（开机后仍需执行）</th></tr>
+<tr><td>
+NVIDIA driver / Docker / nvidia-container-toolkit（DLAMI 自带）<br>
+EFA userspace 1.48.0<br>
+kubeadm / kubelet / kubectl v1.31 + containerd 配置（SystemdCgroup + NVIDIA runtime）<br>
+推理镜像 <code>sglang-mooncake-uccl</code>（已在 containerd 命名空间）<br>
+EFA device plugin 镜像（已导入 + imagePullPolicy: Never 可直接用）<br>
+内核模块 / sysctl / swap 配置
+</td><td>
+<code>kubeadm init / join</code>（集群身份不能固化）<br>
+模型权重分发到 <code>/mnt/nvme</code>（实例存储不进 AMI，且新实例本地盘是空的）<br>
+EFA rail 设备名确认（<code>rdmapXXs0</code> 枚举结果同机型一致，但建议开机后复核）
+</td></tr>
+</table>
+
+<h4>4.5.2 打镜像操作</h4>
+<pre><code># 1. 选一台配置完成的节点（若已 join 集群, 先 reset 清掉集群身份）:
+sudo kubeadm reset -f && sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd
+
+# 2. 创建 AMI（--no-reboot 可不停机, 但停机打更一致; 实例存储卷不会进 AMI）
+aws ec2 create-image --region &lt;R&gt; \
+  --instance-id i-xxxxxxxxxxxx \
+  --name "p5en-inference-golden-$(date +%Y%m%d)" \
+  --description "AL2023 DLAMI + EFA 1.47 + k8s 1.31 + sglang-mooncake-uccl preloaded" \
+  --tag-specifications 'ResourceType=image,Tags=[{Key=Project,Value=p5en-inference}]'
+
+# 3. 等待可用（1TB 根盘约 10-20 分钟）
+aws ec2 wait image-available --region &lt;R&gt; --image-ids ami-yyyyyyyy
+aws ec2 describe-images --region &lt;R&gt; --image-ids ami-yyyyyyyy \
+  --query 'Images[0].{state:State,name:Name}'</code></pre>
+
+<div class="box warn">
+<b>&#9888;&#65039; 注意</b>
+<ul style="margin:4px 0">
+<li>AMI 只快照 <b>EBS 卷</b>（根盘 + 数据盘映射），<b>实例存储（/mnt/nvme RAID0）不进 AMI</b> —— 新实例开机后 userdata 会重新组 RAID，模型权重需重新从 S3 分发（§7）。</li>
+<li>数据盘快照会随 AMI 一起创建，2TB 盘会增加 AMI 创建时间和快照存储费用；若数据盘无需固化内容，打镜像前可在 <code>create-image</code> 加 <code>--block-device-mappings '[{"DeviceName":"/dev/xvdb","NoDevice":""}]'</code> 排除。</li>
+<li>推理镜像更新（如换新的 h200 标签）后记得<b>重打 AMI</b>，保持 golden image 与生产版本一致。</li>
+<li>CB 到期<b>前</b>就要打好 AMI —— 实例回收后就没有机会了。建议纳入 CB 到期前 checklist。</li>
+</ul>
+</div>
+
+<h4>4.5.3 换 CB 块后快速开机流程</h4>
+<pre><code># 1. 新 CB 购买后拿到新的 cr-id（AZ 可能变化, 子网需对应调整）
+# 2. 更新 IaC 参数后 apply:
+#    Terraform:      terraform.tfvars 里改 ami_id=ami-yyyyyyyy, capacity_reservation_id=cr-new
+#    CloudFormation: update-stack 改 AmiId + CapacityReservationId 参数
+# 3. 开机后每节点只需三步（对比全新装机省 ~30 分钟/节点）:
+bash scripts/verify-node.sh                  # GPU/EFA/RAID 验证
+#    模型分发:  s5cmd cp s3://<bucket>/models/... /mnt/nvme/models/
+#    组集群:    master 跑 kubeadm init, 其余 join → 直接进入 §8 部署</code></pre>
+
+<table>
+<tr><th>环节</th><th>原始 DLAMI 首次装机</th><th>golden AMI 换块开机</th></tr>
+<tr><td>EFA/K8s 组件安装</td><td>~10 分钟/节点</td><td>0（已固化）</td></tr>
+<tr><td>推理镜像拉取+导入</td><td>~15-20 分钟/节点</td><td>0（已固化）</td></tr>
+<tr><td>模型权重分发</td><td>视模型大小</td><td>相同（实例存储不可固化）</td></tr>
+<tr><td>kubeadm init/join</td><td>~5 分钟</td><td>~5 分钟</td></tr>
+</table>
+
+<h3 id="s4c"><span class="step-num">4.7</span>磁盘方案设计边界与竞态知识（知识沉淀）</h3>
+
+<p>本方案让 docker/containerd 数据目录<b>不落根盘</b>的实现，是 <code>setup-local-disks.service</code>
+（systemd <code>Before=docker/containerd</code>）把<b>空目录</b> bind 到本地 NVMe RAID0（<code>/mnt/nvme</code>）。
+业界另有一条参考路线——eks-enterprise-quickstart 的 <b>EBS 数据盘 + LVM + rsync 迁移</b>方案，
+其代码注释中记录过一次真实竞态事故。本节沉淀两条路线的边界结论，<b>不涉及任何脚本改动</b>。</p>
+
+<h4>4.7.1 为什么本方案没有 containerd 迁移竞态</h4>
+<p>eks-quickstart 记录的事故链：AMI 自带的 containerd 开机先在<b>根盘</b>启动 →
+旧流程 stop 时未等 boltdb 落盘、就对<b>正在变化的</b> content store 做 rsync（错误被 <code>|| true</code> 吞掉）
+→ <code>metadata.db</code> 引用的 blob 文件未真正落到 EBS → 少数节点
+<code>blob not found</code> / <code>ImagePullBackOff</code>。该竞态需要三个条件同时成立，本方案一个都不满足：</p>
+<table>
+<tr><th>竞态成立条件（eks-quickstart）</th><th>本方案（v11）</th></tr>
+<tr><td>containerd 已在根盘启动、boltdb 有未落盘数据</td><td>重启路径：systemd <code>Before=</code> 排序保证 daemon 在 bind 完成前不可能启动；首启路径：<code>systemctl stop</code>（同步等待）后才 bind</td></tr>
+<tr><td>对"活的" content store 做 rsync 迁移</td><td><b>不迁移</b>——bind 的是空目录，根盘旧数据只是被遮蔽（shadow），不存在 torn-copy</td></tr>
+<tr><td>空 store 致命：EKS AL2023 AMI pin <code>sandbox_image=localhost/kubernetes/pause</code>，本地引用不可重拉（awslabs/amazon-eks-ami#2000 / #2122）</td><td>DLAMI + kubeadm 自建，pause 来自 registry.k8s.io 可重拉；业务镜像本就走 <code>ctr import</code> 流程，空 store 是安全起点</td></tr>
+</table>
+<div class="box key">
+<b>&#128273; 结论</b>
+eks-quickstart 的 <code>mask containerd + EXIT trap + rsync fail-fast</code> 全套重手段，
+是它的特殊前提（EKS AMI containerd 自启 + pause 不可重拉）逼出来的；
+本方案靠"<b>daemon 启动前完成 + 空目录 bind</b>"从结构上绕开了竞态，<b>不需要、也不要把那套复杂度引入</b>。
+</div>
+
+<h4>4.7.2 适用边界：方案依赖 instance-store，本项目仅 p5en 故成立</h4>
+<table>
+<tr><th>机型</th><th>本方案覆盖情况</th></tr>
+<tr><td>p5en.48xlarge（本项目全部节点）</td><td>&#9989; 覆盖：8x 3.5TB 本地盘组 RAID0；真机已验证（含 stop/start 自愈）</td></tr>
+<tr><td>CPU <code>d</code> 机型（m6id/c6id 等，未来若加）</td><td>&#9989; 天然覆盖，脚本零修改（单盘也可组 RAID0 + bind）</td></tr>
+<tr><td>CPU EBS-only 机型（m6i/c6i 等，未来若加）</td><td>&#10060; <b>不覆盖</b>：脚本发现无本地盘直接 <code>exit 0</code>，docker/containerd 落根盘——镜像层/容器日志写满根盘 → kubelet DiskPressure 驱逐、节点 NotReady；若是专职 master 还与 etcd 抢根盘 IOPS。对策：优先换 <code>d</code> 机型；确需 EBS-only 机型时移植 eks-quickstart 的 EBS+LVM 方案（届时 mask/trap/rsync-fail-fast 缺一不可，否则即复现其事故）</td></tr>
+</table>
+
+<h4>4.7.3 静默退化路径：2026-07-05 真机踩中，已修复（fail-fast + NAT 出网 + mdadm 重试）</h4>
+<div class="box warn">
+<b>&#9888;&#65039; 事故链（实测复盘）</b>
+p5en 这类多网卡启动模板会<b>忽略子网的 <code>MapPublicIpOnLaunch</code></b> → 公有子网里主 ENI
+仍无公网 IP、开机初期完全无出网 → <code>dnf install mdadm</code> 拉 repo 超时
+（AL2023 GPU DLAMI <b>不预装 mdadm</b>）→ 旧脚本 <code>|| true</code> 吞掉错误 →
+RAID 未建、bind 把<b>根盘目录</b>挂到 <code>/var/lib/docker|containerd</code>、
+服务状态仍 <code>active</code>——数据静默落根盘。
+</div>
+<p><b>已落地的三层修复</b>（v12 当前版本）：</p>
+<table>
+<tr><th>层</th><th>修复</th><th>位置</th></tr>
+<tr><td>网络（07-06 修正）</td><td>多网卡启动<b>禁止</b> <code>AssociatePublicIpAddress</code>（EC2 API 400，真机 ROLLBACK 实锤）且忽略子网 auto-assign → p5en 开机不可能有公网 IP。<b>标准方案 = 私有子网 + NAT Gateway</b>（次选 = 开机后手工挂 EIP）；<code>preflight-cr.sh</code> 新增出网路由检查（默认路由 igw-* 直接 FAIL）</td><td>模板注释固化 ×4 份 + preflight</td></tr>
+<tr><td>userdata</td><td>mdadm 安装改为 <b>30 次 × 10s 重试</b>（等网络就绪），仍失败则打 FATAL 日志</td><td>4 份 userdata（[2/4] 段）</td></tr>
+<tr><td>脚本 fail-fast</td><td>mdadm 缺失即 <code>exit 1</code>；bind 前校验 <code>findmnt -no SOURCE /mnt/nvme == /dev/md0</code>，不符即 <code>exit 1</code>——服务进 <code>failed</code> 状态，<b>可见可告警，杜绝静默落根盘</b></td><td><code>scripts/setup-local-disks.sh</code>（base64 已同步重新内嵌）</td></tr>
+</table>
+<p>人工检测不变：<code>grep md /proc/mounts</code> 应 3 行（/mnt/nvme + 两个 bind，设备名可能是 md0 或 md127，见 4.7.4）；
+异常排查 <code>journalctl -u setup-local-disks.service</code> 与
+<code>/var/log/p5en-bootstrap.log</code>。golden AMI 仍建议预装 mdadm（不依赖网络，换块开机彻底免疫）。</p>
+
+<h4>4.7.4 reboot 路径：2026-07-07 真机踩中，已修复（探测复用已组装阵列）</h4>
+<div class="box warn">
+<b>&#9888;&#65039; 事故链（实测复盘）</b>
+<b>reboot ≠ stop/start</b>。软重启（OS 内 <code>reboot</code> 或控制台 Reboot）<b>不换宿主机</b>，
+本地盘保留 RAID 超级块 → 内核在自愈服务运行前就把阵列<b>自动组装成 <code>/dev/md127</code></b> →
+旧脚本硬编码 <code>md0</code> 且假设空盘，<code>mdadm --create /dev/md0</code> 报
+<code>Device or resource busy</code> → fail-fast 校验正确拦截（挂载源非 md0，拒绝 bind）→
+服务 <code>failed</code>。<b>保护生效（未静默落根盘），但本地盘整轮未被使用</b>，
+docker/containerd 跑在根盘。
+</div>
+<p><b>修复</b>（v12 当前版本，真机验证 4/4）：脚本在组建前先探测这些 instance-store 盘是否已属于某个
+md 设备（<code>lsblk -rno NAME,TYPE</code> 查 <code>raid*</code> 类型），已有则直接复用该设备名
+（如 md127）挂载 + bind；仅全新空盘（stop/start 换宿主机）才走 <code>create md0</code>。
+fail-fast 校验同步改为对比探测到的实际设备。两条路径行为：</p>
+<table>
+<tr><th>场景</th><th>宿主机</th><th>本地盘数据</th><th>脚本行为</th></tr>
+<tr><td>stop/start</td><td>更换</td><td>全丢（新空盘）</td><td>create md0 → mkfs → 挂载 → bind</td></tr>
+<tr><td>reboot</td><td>不变</td><td><b>保留</b>（同一组盘）</td><td>复用内核已组装的 md127 → 直接挂载 → bind（不 mkfs，数据仍在）</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<!-- 第二部分 -->
+<!-- ================================================================ -->
+<h2 id="part2" style="background:var(--primary);color:#fff;padding:12px 20px;border:none;border-radius:6px">第二部分：容器镜像与自建 K8s 环境（EFA 适配）</h2>
+
+<div class="box key">
+<b>&#128273; 本部分重要配置（部署前必读）</b>
+<table style="margin:8px 0">
+<tr><th>配置项</th><th>值</th><th>为什么</th></tr>
+<tr><td>镜像</td><td><code>public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16</code>（或按 <code>Dockerfile.customer-h200</code> 自建）</td><td>大 DP（Decode dp64）必须含 Mooncake PR #2023 修复，否则 DP worker 连接风暴</td></tr>
+<tr><td>Mooncake 协议补丁</td><td>sglang <code>mooncake_transfer_engine.py</code> 协议 <code>"rdma"→"efa"</code>（镜像已内置）</td><td>Mooncake USE_EFA=ON 构建下传 "rdma" 会静默回落 TCP，KV 传输分钟级延迟</td></tr>
+<tr><td>Pod 网络模式</td><td><code>hostNetwork: true</code> + <code>hostIPC: true</code> + <code>privileged: true</code></td><td>EFA RDMA 设备直通 + NVLink IPC + pinned memory</td></tr>
+<tr><td>Pod 资源</td><td><code>nvidia.com/gpu: 8</code> + <code>vpc.amazonaws.com/efa: 16</code>/节点</td><td>整机独占；EFA device plugin 暴露 16 个 EFA 设备</td></tr>
+<tr><td>NCCL 网口</td><td>Pod 内 <code>NCCL_SOCKET_IFNAME</code>：hostNetwork 用 <code>enp</code>，CNI 网络用 <code>eth0</code></td><td>接口名错误导致 NCCL bootstrap 失败</td></tr>
+<tr><td>libfabric 必备 env</td><td><code>FI_PROVIDER=efa</code>, <code>FI_EFA_USE_DEVICE_RDMA=1</code>, <code>FI_EFA_FORK_SAFE=1</code>, <code>FI_EFA_USE_HUGE_PAGE=0</code></td><td>efa-validation 仓库多轮验证的固定组合</td></tr>
+<tr><td>VPC CNI 限制</td><td><code>MAX_ENI=1</code> + <code>WARM_ENI_TARGET=0</code></td><td>阻止 CNI 往 EFA ENI 上分配 Pod IP（EFA ENI 不做 IP 转发，Pod 会失联）</td></tr>
+<tr><td>模型路径</td><td>本地 <code>/mnt/nvme/models/...</code></td><td>S3 → NVMe，加载最快；禁 FSx / HF 直拉</td></tr>
+</table>
+</div>
+
+<h3 id="s5"><span class="step-num">5</span>推理容器镜像</h3>
+
+<h4>5.1 镜像选型</h4>
+<p>镜像来自 <a href="https://github.com/KevinZhao/efa-validation/blob/main/common/Dockerfile.customer-h200">KevinZhao/efa-validation 的 <code>common/Dockerfile.customer-h200</code></a>，
+一份 Dockerfile 通过 <code>ARG WITH_UCCL</code> 出两个变体：</p>
+<table>
+<tr><th>变体</th><th>镜像</th><th>MoE all-to-all</th><th>大小</th><th>适用</th></tr>
+<tr><td><b>uccl</b>（本项目用）</td><td><code>public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl</code></td><td>UCCL-EP（<code>--moe-a2a-backend deepep</code>）</td><td>~11-12 GB</td><td>跨机 MoE EP（本项目 ep32/ep64 必须）</td></tr>
+<tr><td>nccl</td><td><code>public.ecr.aws/n3l4x8f3/sglang-mooncake-nccl</code></td><td>NCCL（<code>--moe-a2a-backend none</code>）</td><td>~8-9 GB</td><td>单机 MoE / A/B 基线对比</td></tr>
+</table>
+
+<div class="box warn">
+<b>&#9888;&#65039; 标签选择：大 DP 必须用含 PR #2023 的版本</b>
+efa-validation 仓库 BUILD_MATRIX 明确：<code>2026.05.02-h200.dp16</code>（或此后基于 Mooncake <code>v0.3.11.post1</code> 的任何 release）
+含 DP&gt;1 根因修复（<i>key peer_map_ by full host:port@nic</i>）。旧版在 sglang DP&gt;1 时所有 DP worker 共用同一
+EfaEndPoint 槽位，触发 <code>fi_av_remove/insert</code> 抖动（日志出现 "Re-establish" 刷屏、decode #running 掉到 1）。
+本项目 Decode 侧 dp64，<b>必须</b>使用修复后的镜像。
+</div>
+
+<p style="font-size:13.5px">&#128218; 配套深入文档：
+<a href="mooncake-efa-analysis.html"><b>《Mooncake EFA 改版与原版代码差异分析》</b></a>（镜像内 Mooncake 相对原版改了什么）·
+<a href="comm-stack-relationship.html"><b>《NCCL / DeepEP / UCCL-EP / Mooncake / NIXL 关系图谱》</b></a>（五个通信组件各管什么、为何这样选型）。</p>
+
+<h4>5.2 镜像内容（构建自 Dockerfile.customer-h200 的实际 pin）</h4>
+<table>
+<tr><th>层</th><th>Pin</th><th>要点</th></tr>
+<tr><td>Base</td><td><code>nvidia/cuda:13.0.2-cudnn-devel-ubuntu22.04</code></td><td>CUDA 13 runtime + 自带 NCCL 2.28.3</td></tr>
+<tr><td>EFA installer</td><td>1.48.0（<code>--skip-kmod</code>，容器内只装 userspace）</td><td>libfabric SRD provider；内核模块用宿主机 DLAMI 的</td></tr>
+<tr><td>aws-ofi-nccl</td><td>v1.19.0 源码自建 → <code>/opt/aws-ofi-nccl</code></td><td>NCCL 跨机走 EFA 的插件</td></tr>
+<tr><td>SGLang</td><td>0.5.10（pip <code>sglang[all]</code>，带 torch 2.9.1+cu128）</td><td>构建期 sed 补丁：<code>mooncake_transfer_engine.py</code> 协议 rdma→efa，带 fail-fast 校验</td></tr>
+<tr><td>Mooncake TE</td><td><code>v0.3.11.post1</code>，<code>USE_EFA=ON WITH_TE=ON WITH_EP=OFF WITH_STORE=OFF</code></td><td>WITH_EP=OFF 是故意的：Mooncake-EP 仅支持 Mellanox IBGDA，EFA 上跑不了</td></tr>
+<tr><td>UCCL-EP</td><td><code>@8ac850bd</code> + deep_ep drop-in wrapper，<code>PER_EXPERT_BATCHING=1</code></td><td>wrapper 把 <code>import deep_ep</code> 重定向到 <code>uccl.ep</code>，SGLang 无感使用</td></tr>
+<tr><td>诊断工具</td><td><code>/opt/mooncake/install/bin/transfer_engine_bench</code>、<code>efa_transport_test</code></td><td>可独立复现 Mooncake 官方 EFA 测试协议</td></tr>
+</table>
+
+<h4>5.3 直接拉取（推荐）</h4>
+<pre><code># 每台节点执行；镜像在 public ECR，无需认证
+docker pull public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+
+# K8s(containerd) 环境需要导入 containerd 命名空间
+docker save public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16 \
+  | sudo ctr -n k8s.io images import -</code></pre>
+
+<h4>5.4 自建镜像（可选，客户需定制时）</h4>
+<pre><code>git clone https://github.com/KevinZhao/efa-validation.git
+cd efa-validation
+
+docker build -f common/Dockerfile.customer-h200 \
+  --build-arg WITH_UCCL=true \
+  --build-arg VARIANT=uccl \
+  --build-arg IMAGE_VERSION=$(date +%Y.%m.%d)-h200 \
+  -t &lt;your-registry&gt;/sglang-mooncake-uccl:$(date +%Y.%m.%d)-h200 .
+# 构建耗时较长（Mooncake + UCCL 源码编译）；建议在一台 GPU 构建机上执行后推 ECR</code></pre>
+
+<h4>5.5 镜像验收（任一 GPU 节点上跑）</h4>
+<pre><code>IMG=public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+docker run --rm --gpus all $IMG bash -c '
+  python -c "import torch; print(torch.__version__, torch.version.cuda)"      # 2.9.1+cu128
+  python -c "import sglang; print(sglang.__version__)"                         # 0.5.10
+  python -c "from mooncake.engine import TransferEngine; print(\"mooncake OK\")"
+  python -c "import uccl.ep; print(\"uccl.ep OK\")"
+  python -c "import deep_ep; assert deep_ep.Config.__module__.startswith(\"uccl\"); print(\"deep_ep->uccl OK\")"
+  python -c "import inspect, sglang.srt.distributed.device_communicators.mooncake_transfer_engine as m; \
+             assert chr(34)+\"efa\"+chr(34)+\",\" in inspect.getsource(m) or \"efa\" in inspect.getsource(m); print(\"efa patch OK\")"
+  cat /opt/BUILD_INFO.json'
+
+# EFA 直通验证（需要 --network host + 设备挂载）
+docker run --rm --gpus all --network host --privileged $IMG fi_info -p efa -l
+# 期望: 16 个 rdmapXXs0 设备</code></pre>
+
+<h3 id="s6"><span class="step-num">6</span>自建 Kubernetes 集群（kubeadm + EFA 适配）</h3>
+
+<p>流程来自本地已验证的 <code>ec2-self-k8s-GPU-kubeflow.skill</code>（自建 K8s + NVIDIA/EFA device plugin，含 12 条踩坑记录）。
+该 skill 在 Ubuntu 24.04 上验证；本项目基础 AMI 是 <b>AL2023 DLAMI</b>，包管理相应从 apt 换成 dnf/rpm，其余逻辑一致。</p>
+
+<div class="box key">
+<b>&#128273; K8s 网络设计决策</b>
+<ul style="margin:4px 0">
+<li><b>RDMA 流量与 CNI 无关</b>：NCCL/Mooncake/UCCL 通过 aws-ofi-nccl / libfabric 直接走 EFA 设备，完全绕过 Pod CNI 网络。CNI 只承载控制面 TCP（rendezvous、K8s Service、router 分发）。</li>
+<li><b>本项目所有推理 Pod 用 <code>hostNetwork: true</code></b>：PD 分离要求 Pod 间以节点 IP 互访（dist-init-addr、bootstrap 端口），host 网络最直接且免除 CNI 性能层。</li>
+<li>CNI 选择：跑 Flannel 即可满足 kube-system 组件通信；若要求 Pod 用 VPC 原生 IP 可切换 AWS VPC CNI，但<b>必须</b>设 <code>MAX_ENI=1</code> + <code>WARM_ENI_TARGET=0</code>，否则 CNI 会向 EFA ENI 分配 secondary IP 导致跨节点 Pod 失联（skill 已踩坑 #9）；且移除 Flannel 后必须把 iptables FORWARD 策略改回 ACCEPT（踩坑 #10）。</li>
+</ul>
+</div>
+
+<h4>6.1 所有节点：K8s 前置（AL2023 适配版）</h4>
+<pre><code>#!/bin/bash
+# 所有节点执行（master + worker）
+set -e
+
+# 1. 关 swap（AL2023 默认无 swap，防御性执行）
+sudo swapoff -a; sudo sed -i '/swap/d' /etc/fstab
+
+# 2. 内核模块 + sysctl
+cat &lt;&lt;EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+sudo modprobe overlay br_netfilter
+cat &lt;&lt;EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
+
+# 3. containerd: SystemdCgroup + NVIDIA runtime
+#    (DLAMI 自带 containerd + nvidia-container-toolkit)
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml &gt; /dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo nvidia-ctk runtime configure --runtime=containerd --set-as-default
+# 坑: nvidia-container-toolkit 1.19 的 nvidia-ctk 会把 nvidia runtime 段的
+# SystemdCgroup 重置回 false (eks-quickstart userdata 实录), 必须在 nvidia-ctk 之后再改一次并校验:
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+grep -c 'SystemdCgroup = true' /etc/containerd/config.toml   # 期望 >=1 且无 false
+grep -c 'SystemdCgroup = false' /etc/containerd/config.toml || true  # 期望 0
+sudo systemctl enable --now containerd
+sudo systemctl restart containerd
+# SystemdCgroup 不一致的症状: Pod 报 FailedCreatePodSandBox /
+#   runc create failed: expected cgroupsPath to be of format "slice:prefix:name"
+
+# 4. kubeadm / kubelet / kubectl v1.31 (rpm 源)
+cat &lt;&lt;EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/repodata/repomd.xml.key
+EOF
+sudo dnf install -y kubelet kubeadm kubectl conntrack-tools --disableexcludes=kubernetes
+sudo systemctl enable kubelet</code></pre>
+
+<h4>6.2 Master 初始化 + CNI</h4>
+<pre><code># 在第 1 台节点（master，同时也跑推理负载）
+sudo kubeadm init \
+  --apiserver-advertise-address=&lt;MASTER私有IP&gt; \
+  --pod-network-cidr=10.244.0.0/16 \
+  --node-name=node0
+
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# 去掉 control-plane 污点（master 也要跑推理 Pod）
+kubectl taint nodes node0 node-role.kubernetes.io/control-plane:NoSchedule-
+
+# Flannel CNI（承载 kube-system 控制面流量）
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml</code></pre>
+
+<h4>6.3 其余节点 join</h4>
+<pre><code># kubeadm init 输出的 join 命令，在其余所有节点执行:
+sudo kubeadm join &lt;MASTER私有IP&gt;:6443 \
+  --token &lt;TOKEN&gt; --discovery-token-ca-cert-hash sha256:&lt;HASH&gt; \
+  --node-name=node&lt;N&gt;
+
+# token 过期后重新生成:
+kubeadm token create --print-join-command</code></pre>
+
+<h4>6.4 NVIDIA device plugin</h4>
+<pre><code>kubectl apply -f \
+  https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.1/deployments/static/nvidia-device-plugin.yml</code></pre>
+
+<h4>6.5 AWS EFA device plugin</h4>
+<p>EFA plugin 镜像在<b>需认证的 ECR</b>（<code>602401143452.dkr.ecr.&lt;region&gt;.amazonaws.com</code>），
+自建 K8s 无 EKS 凭据链，需 Docker 拉取后导入 containerd 并设 <code>imagePullPolicy: Never</code>（skill 踩坑 #3）：</p>
+<pre><code># 每台节点:
+REGION=us-east-2
+EFA_IMG="602401143452.dkr.ecr.${REGION}.amazonaws.com/eks/aws-efa-k8s-device-plugin:v0.5.7"
+aws ecr get-login-password --region $REGION | \
+  docker login --username AWS --password-stdin 602401143452.dkr.ecr.${REGION}.amazonaws.com
+docker pull $EFA_IMG
+docker save $EFA_IMG | sudo ctr -n k8s.io images import -</code></pre>
+
+<p>DaemonSet（须挂载 <code>/dev/infiniband</code> 和 <code>/sys</code>，否则报 <code>No valid EFA devices found</code> — skill 踩坑 #4）：</p>
+<pre><code>apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-efa-k8s-device-plugin
+  namespace: kube-system
+spec:
+  selector: { matchLabels: { name: aws-efa-k8s-device-plugin } }
+  template:
+    metadata: { labels: { name: aws-efa-k8s-device-plugin } }
+    spec:
+      tolerations:
+        - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      containers:
+        - name: aws-efa-k8s-device-plugin
+          image: 602401143452.dkr.ecr.us-east-2.amazonaws.com/eks/aws-efa-k8s-device-plugin:v0.5.7
+          imagePullPolicy: Never
+          securityContext: { privileged: true }
+          volumeMounts:
+            - { name: device-plugin, mountPath: /var/lib/kubelet/device-plugins }
+            - { name: infiniband-devices, mountPath: /dev/infiniband }
+            - { name: sys, mountPath: /sys }
+      volumes:
+        - { name: device-plugin, hostPath: { path: /var/lib/kubelet/device-plugins } }
+        - { name: infiniband-devices, hostPath: { path: /dev/infiniband } }
+        - { name: sys, hostPath: { path: /sys } }</code></pre>
+
+<h4>6.6 集群验收</h4>
+<pre><code>kubectl get nodes                          # 全部 Ready
+kubectl get pods -A | grep -E 'nvidia|efa' # device plugin 每节点各 1 个 Running
+
+# 每节点可分配资源必须是:
+kubectl describe node node0 | grep -A8 Allocatable
+#   nvidia.com/gpu:         8
+#   vpc.amazonaws.com/efa:  16</code></pre>
+
+<div class="box warn">
+<b>&#9888;&#9888;&#65039; skill 踩坑速记（自建 K8s 特有）</b>
+<ul style="margin:4px 0">
+<li>自建集群<b>不会</b>自动打 <code>node.kubernetes.io/instance-type</code> 标签，不要在 nodeSelector 里用它；需要则手动 <code>kubectl label</code>（踩坑 #8）。</li>
+<li>CPU request 不要写满 192（p5en vCPU），留 ~10 给系统组件（踩坑 #2）。</li>
+<li>推理镜像 11-12GB，提前 <code>docker pull + ctr import</code> 到每台节点，避免 Pod 长时间 ContainerCreating（踩坑 #6）。</li>
+</ul>
+</div>
+
+<h4>6.7 GPU 可观测性组件（生产必装，参考 eks-gpu-stack standard 模式）</h4>
+<p><a href="https://github.com/aws-samples/sample-eks-enterprise-quickstart">eks-quickstart</a> 的
+<code>terraform/modules/eks-gpu-stack</code> 在 device plugin 之外还部署四个监控组件，自建 K8s 同样适用
+（helm chart 不依赖 EKS）。长稳推理集群建议全装：</p>
+
+<table>
+<tr><th>组件</th><th>作用</th><th>安装来源</th></tr>
+<tr><td><b>GFD</b>（GPU Feature Discovery）</td><td>给节点自动打 <code>nvidia.com/gpu.product</code> 等标签（弥补自建集群无 instance-type 标签）</td><td>nvidia-device-plugin helm chart 内置（<code>gfd.enabled=true</code>）</td></tr>
+<tr><td><b>dcgm-exporter</b></td><td>GPU 利用率/显存/温度/功耗/XID 指标，<code>:9400/metrics</code> 供 Prometheus 抓取</td><td><code>https://nvidia.github.io/dcgm-exporter/helm-charts</code></td></tr>
+<tr><td><b>node-problem-detector</b></td><td>把 GPU XID 错误、内核 hang 等上报为节点 Condition/Event</td><td><code>https://charts.deliveryhero.io/</code></td></tr>
+<tr><td><b>gpu-health-check</b></td><td>开机 nvidia-smi 探测，失败节点自动打 <code>gpu-unhealthy=true:NoSchedule</code> taint 阻止调度</td><td>DaemonSet（eks-gpu-stack 内置清单，可直接移植）</td></tr>
+</table>
+
+<pre><code># 1. nvidia-device-plugin 切换为 helm 安装并启用 GFD
+#    （替代 §6.4 的静态 yaml; mofedEnabled=false 让 EFA plugin 独占 /dev/infiniband/uverbs*）
+helm repo add nvdp https://nvidia.github.io/k8s-device-plugin && helm repo update
+helm upgrade -i nvidia-device-plugin nvdp/nvidia-device-plugin \
+  -n kube-system --version 0.17.1 \
+  --set gfd.enabled=true --set mofedEnabled=false
+
+# 2. dcgm-exporter
+helm repo add dcgm https://nvidia.github.io/dcgm-exporter/helm-charts && helm repo update
+helm upgrade -i dcgm-exporter dcgm/dcgm-exporter -n kube-system
+# 验证: kubectl port-forward -n kube-system ds/dcgm-exporter 9400:9400
+#       curl localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
+
+# 3. node-problem-detector
+helm repo add deliveryhero https://charts.deliveryhero.io/ && helm repo update
+helm upgrade -i node-problem-detector deliveryhero/node-problem-detector -n kube-system
+
+# 4. gpu-health-check（清单已随交付物提供: skills/www/manifests/gpu-health-check.yaml）
+kubectl apply -f manifests/gpu-health-check.yaml
+# 验证: kubectl logs -n kube-system -l app.kubernetes.io/name=gpu-health-check | grep PASS
+# 探测失败的节点会被打 gpu-unhealthy=true:NoSchedule taint, 恢复后自动摘除</code></pre>
+
+<div class="box key">
+<b>&#128273; 自建 K8s 移植注意</b>
+eks-gpu-stack 的 chart values 里用 <code>nodeSelector: workload-type=gpu</code> 圈定 GPU 节点——
+自建集群没有这个标签。本集群所有节点都是 GPU 节点，可直接去掉 nodeSelector；
+或先统一打标签 <code>kubectl label nodes --all workload-type=gpu</code> 再沿用原 values。
+gpu-health-check 的 DaemonSet 清单已从 eks-quickstart <code>terraform/modules/eks-gpu-stack/main.tf</code>
+翻译为可直接 apply 的 yaml（alpine/k8s 镜像 + nsenter 宿主机执行 nvidia-smi + kubectl taint），
+见交付物 <code>skills/www/manifests/gpu-health-check.yaml</code>。
+</div>
+
+<h3 id="s7"><span class="step-num">7</span>模型权重分发</h3>
+
+<div class="box key">
+<b>&#128273; 权重加载规则（efa-validation 仓库硬性结论）</b>
+一律从<b>同 Region S3 拉到节点本地 NVMe</b>（<code>/mnt/nvme</code>），<code>--model-path</code> 只指本地路径。
+禁 FSx（跨 AZ + 并发 mmap 慢 8×）、禁 HuggingFace 直拉（匿名限流）、禁跨 AZ 共享。
+</div>
+
+<pre><code># 每台节点并行执行（s5cmd 比 aws s3 cp 快数倍, 或用 aws s3 cp --recursive）
+sudo mkdir -p /mnt/nvme/models && sudo chmod 1777 /mnt/nvme/models
+
+# 方式 1: aws cli
+aws s3 cp --recursive \
+  s3://&lt;bucket&gt;/models/&lt;MODEL_NAME&gt;/ /mnt/nvme/models/&lt;MODEL_NAME&gt;/ \
+  --only-show-errors
+
+# 方式 2: s5cmd（推荐, 并发默认 256）
+s5cmd cp "s3://&lt;bucket&gt;/models/&lt;MODEL_NAME&gt;/*" /mnt/nvme/models/&lt;MODEL_NAME&gt;/
+
+# 校验: 各节点权重目录大小一致
+du -sh /mnt/nvme/models/&lt;MODEL_NAME&gt;</code></pre>
+
+<div class="box warn">
+<b>&#9888;&#65039; 实例存储重启即失效</b>
+节点 stop/start 后 <code>/mnt/nvme</code> 清空，需重跑分发。可将分发脚本注册为 systemd oneshot 或纳入节点上线 checklist。
+JIT 缓存目录（DeepGEMM/Triton 等）同样建议放 <code>/mnt/nvme</code> 或 <code>/data</code>，冷启动 JIT 编译 10-20 分钟、热缓存秒级。
+</div>
+
+<h3 id="s8"><span class="step-num">8</span>2P2D 部署验证（4 台，先跑通）</h3>
+
+<p>参考两份已验证配置：
+<a href="https://github.com/KevinZhao/efa-validation/tree/main/customer_glm_5.1">efa-validation/customer_glm_5.1</a>（GLM-5.1 2P2D docker-compose，Mooncake KV + UCCL-EP）
+与 <a href="https://github.com/yuhuiaws/ML-study/blob/main/%E7%94%9F%E6%88%90%E5%BC%8FAI/Claude-code-Skills/sglang-2p2d-ucclep-nixl.skill">sglang-2p2d-ucclep-nixl.skill</a>（DeepSeek-V3 2P2D，K8s Pod）。
+本章 K8s 化部署：4 个 Pod（prefill-0/1 + decode-0/1）+ 1 个 router。</p>
+
+<h4>8.1 拓扑与端口约定</h4>
+<table>
+<tr><th>角色</th><th>节点</th><th>并行</th><th>DeepEP 模式</th><th>服务端口</th><th>dist-init</th></tr>
+<tr><td>Prefill</td><td>node0 + node1（2×8 卡）</td><td>tp8 / pp2 / dp1（GLM-5.1 参考配置）或 tp16/dp8（DSv3 参考配置）</td><td>normal</td><td>30000</td><td><code>&lt;node0_IP&gt;:5757</code></td></tr>
+<tr><td>Decode</td><td>node2 + node3（2×8 卡）</td><td>tp16 / dp16 + dp-attention</td><td>low_latency</td><td>30001</td><td><code>&lt;node2_IP&gt;:5757</code></td></tr>
+<tr><td>Router</td><td>任意节点</td><td>—</td><td>—</td><td>8000</td><td>—</td></tr>
+</table>
+
+<h4>8.2 Pod 模板（prefill-node0 示例，其余 3 个只改 name/nodeSelector/启动参数）</h4>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: prefill-node0
+spec:
+  nodeSelector: { kubernetes.io/hostname: node0 }
+  hostNetwork: true          # PD 分离要求 Pod 以节点 IP 互访
+  hostIPC: true              # NVLink/NVSwitch IPC
+  restartPolicy: Never
+  containers:
+  - name: sglang
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+    command: ["sleep", "infinity"]   # 先起容器, 用 kubectl exec 启服务, 便于调试
+    securityContext:
+      privileged: true
+      capabilities: { add: ["IPC_LOCK"] }   # RDMA pinned memory
+    resources:
+      requests: &amp;res
+        nvidia.com/gpu: 8
+        vpc.amazonaws.com/efa: 16
+        memory: "1500Gi"          # p5en 2TB 内存, 留系统余量
+        cpu: "180"                # 192 vCPU 留系统余量 (skill 踩坑 #2)
+      limits: *res
+    volumeMounts:
+    - { name: models, mountPath: /models }
+    - { name: data,   mountPath: /data }
+    - { name: shm,    mountPath: /dev/shm }
+  volumes:
+  - { name: models, hostPath: { path: /mnt/nvme/models } }
+  - { name: data,   hostPath: { path: /data } }
+  - { name: shm,    emptyDir: { medium: Memory, sizeLimit: "512Gi" } }</code></pre>
+
+<h4>8.3 通用环境变量（所有角色）</h4>
+<p>综合 customer_glm_5.1 compose 与 2p2d skill 的验证结果：</p>
+<pre><code># --- EFA / libfabric（必备四件套）---
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export FI_EFA_FORK_SAFE=1
+export FI_EFA_USE_HUGE_PAGE=0
+export FI_MR_CACHE_MONITOR=disabled
+
+# --- NCCL（TP/DP 集合通信跨机走 EFA）---
+export NCCL_SOCKET_IFNAME=enp          # hostNetwork 下宿主接口名前缀
+export NCCL_PROTO=Simple
+export NCCL_CROSS_NIC=1                # 16 NIC 机型
+export NCCL_NVLS_ENABLE=1              # H200 NVLink SHARP
+# 镜像内 aws-ofi-nccl 已在 LD_LIBRARY_PATH, 无需额外 NCCL_NET_PLUGIN
+
+# --- UCCL-EP（MoE all-to-all）---
+export UCCL_SOCKET_IFNAME=enp
+export UCCL_IB_MAX_INFLIGHT_LOW_LATENCY=128
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+
+# --- PD 分离超时（大模型加载慢, 放宽心跳）---
+export SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300
+
+# --- 其他 ---
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTHONUNBUFFERED=1</code></pre>
+
+<div class="box key">
+<b>&#128273; EFA rail 切分（customer_glm_5.1 的关键实践）</b>
+16 张 EFA 分成两半：<b>低 8 rail 给 Mooncake KV，高 8 rail 给 UCCL-EP</b>，避免 KV 传输与 MoE all-to-all 争抢。
+设备名（<code>rdmapXXs0</code>）因机而异，先在节点上枚举再填：
+<pre style="margin:8px 0"><code>ls /sys/class/infiniband/   # 例: rdmap85s0 rdmap86s0 ... rdmap163s0 共 16 个
+
+# UCCL-EP 用高 8 个:
+export UCCL_IB_HCA=rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0
+export FI_EFA_IFACE=$UCCL_IB_HCA
+# Mooncake KV 用 --disaggregation-ib-device 指定(可给全部 16 个或低 8 个, 见 8.4)</code></pre>
+以上设备名取自 customer_glm_5.1 实测机器，<b>不同实例枚举结果不同，必须按实际输出替换</b>。
+</div>
+
+<h4>8.4 启动 Prefill（2 节点，GLM-5.1 参考配置样式）</h4>
+<pre><code># node0 (rank 0) 容器内; node1 改 --node-rank 1
+python3 -m sglang.launch_server \
+  --model-path /models/&lt;MODEL_NAME&gt; \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device &lt;16个rdmap设备名逗号分隔&gt; \
+  --host 0.0.0.0 --port 30000 \
+  --trust-remote-code \
+  --tp-size 8 --pp-size 2 --dp-size 1 \
+  --nnodes 2 --node-rank 0 \
+  --dist-init-addr &lt;PREFILL_MASTER_IP&gt;:5757 \
+  --moe-a2a-backend deepep --deepep-mode normal \
+  --ep-dispatch-algorithm dynamic --eplb-algorithm deepseek \
+  --chunked-prefill-size 16384 \
+  --mem-fraction-static 0.85 \
+  --page-size 64 \
+  --watchdog-timeout 3600</code></pre>
+
+<h4>8.5 启动 Decode（2 节点）</h4>
+<pre><code># node2 (rank 0) 容器内; node3 改 --node-rank 1
+python3 -m sglang.launch_server \
+  --model-path /models/&lt;MODEL_NAME&gt; \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device &lt;16个rdmap设备名逗号分隔&gt; \
+  --host 0.0.0.0 --port 30001 \
+  --trust-remote-code \
+  --tp-size 16 --dp-size 16 --enable-dp-attention \
+  --nnodes 2 --node-rank 0 \
+  --dist-init-addr &lt;DECODE_MASTER_IP&gt;:5757 \
+  --moe-a2a-backend deepep --deepep-mode low_latency \
+  --ep-dispatch-algorithm dynamic --eplb-algorithm deepseek \
+  --mem-fraction-static 0.74 \
+  --cuda-graph-max-bs 16 \
+  --max-running-requests 256 \
+  --page-size 64 \
+  --prefill-round-robin-balance \
+  --watchdog-timeout 1200</code></pre>
+
+<div class="box danger">
+<b>&#10060; page-size 必须两侧一致</b>
+prefill 与 decode 的 <code>--page-size</code> 不一致会在第一个真实请求触发 KV 传输时报
+<code>AssertionError: Page size mismatch</code> 并连环 crash（2p2d skill 实测踩坑）。两侧都显式写 <code>--page-size 64</code>。
+</div>
+
+<h4>8.6 启动 Router 并验证</h4>
+<pre><code># 等两侧日志出现 "The server is fired up and ready to roll!" 后:
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://&lt;PREFILL_MASTER_IP&gt;:30000 \
+  --decode  http://&lt;DECODE_MASTER_IP&gt;:30001 \
+  --host 0.0.0.0 --port 8000
+
+# 冒烟请求
+curl http://&lt;ROUTER_IP&gt;:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"&lt;MODEL_NAME&gt;","messages":[{"role":"user","content":"你好"}],"max_tokens":50}'</code></pre>
+
+<h4>8.7 2P2D 验收清单</h4>
+<table>
+<tr><th>检查项</th><th>方法</th><th>通过标准</th></tr>
+<tr><td>KV 走 EFA 而非 TCP</td><td>prefill 日志 grep <code>transport</code></td><td><b>无</b> <code>Installing TCP transport</code>；有 EFA transport 初始化日志</td></tr>
+<tr><td>NCCL 走 EFA</td><td><code>NCCL_DEBUG=INFO</code> 起一次，grep <code>NET/OFI</code></td><td><code>Selected provider is efa</code> + <code>Using transport protocol RDMA</code></td></tr>
+<tr><td>UCCL-EP 生效</td><td>启动日志</td><td>deep_ep buffer 初始化无错；无 <code>DeepEP is not installed</code></td></tr>
+<tr><td>端到端</td><td>router 冒烟请求</td><td>返回 completion，decode 日志 #running 正常波动</td></tr>
+<tr><td>并发压测</td><td><code>python3 -m sglang.bench_serving --backend sglang --host &lt;ROUTER_IP&gt; --port 8000 ...</code></td><td>rate 1→32 成功率 100%</td></tr>
+</table>
+
+<h3 id="s9"><span class="step-num">9</span>切换到目标部署方案：Prefill 32 卡（pp4/tp8/ep32）+ Decode 64 卡（dp64/ep64）</h3>
+
+<div class="box warn">
+<b>&#9888;&#65039; 这是部署方案的切换，不是扩容</b>
+2P2D 与 4P8D 的<b>并行策略完全不同</b>（Prefill pp2→pp4、Decode tp16/dp16→tp64/dp64），
+切换意味着：
+<ul style="margin:4px 0">
+<li><b>权重切分方式改变</b>：pp4 每个 stage 的层数与 pp2 不同，tp64/dp64 的 expert/attention 分布与 tp16/dp16 不同——服务启动时按新策略重新加载切分；</li>
+<li><b>KV pool 布局改变</b>：dp64 单 rank 容量与 dp16 完全不同（见 §9.4）；</li>
+<li><b>JIT 编译缓存全部失效</b>：新并行形状触发 DeepGEMM / Triton 重新编译（冷启 10-20 分钟，缓存目录可保留但新形状命中率为零）；</li>
+<li><b>全量停服重启</b>：所有 P/D 服务按新参数重新启动、重新组集群（dist-init 组从 nnodes 2 变为 4 和 8），router 重新挂载。</li>
+</ul>
+<b>可复用的部分</b>：基础设施（LT/SG/PG）、镜像、AMI、K8s 集群本体不变——
+新节点开机（改 <code>instance_count</code>）→ <code>kubeadm join</code> → 镜像预热 → 权重分发，然后按 §9.2/9.3 的新参数全量重新拉起。
+</div>
+
+<h4>9.1 目标参数对照</h4>
+<table>
+<tr><th></th><th>2P2D 验证值</th><th>目标值</th><th>说明</th></tr>
+<tr><td>Prefill 节点</td><td>2（16 卡）</td><td><b>4（32 卡）</b></td><td><code>--nnodes 4</code>，node-rank 0..3</td></tr>
+<tr><td>Prefill 并行</td><td>tp8 / pp2</td><td><b>tp8 / pp4</b></td><td><code>--tp-size 8 --pp-size 4</code>；EP 组随 attention 布局展开为 ep32</td></tr>
+<tr><td>Decode 节点</td><td>2（16 卡）</td><td><b>8（64 卡）</b></td><td><code>--nnodes 8</code>，node-rank 0..7</td></tr>
+<tr><td>Decode 并行</td><td>tp16 / dp16</td><td><b>tp64 / dp64</b>（dp-attention，即每卡一个 attention worker，ep64）</td><td><code>--tp-size 64 --dp-size 64 --enable-dp-attention</code></td></tr>
+<tr><td>UCCL dispatch tokens</td><td>128</td><td>视 rank 数调大（32-rank 参考值 512，见下）</td><td><code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td></tr>
+</table>
+
+<h4>9.2 Prefill 4 节点启动（每节点改 --node-rank）</h4>
+<pre><code>python3 -m sglang.launch_server \
+  --model-path /models/&lt;MODEL_NAME&gt; \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device &lt;16个rdmap设备&gt; \
+  --host 0.0.0.0 --port 30000 --trust-remote-code \
+  --tp-size 8 --pp-size 4 --dp-size 1 \
+  --nnodes 4 --node-rank &lt;0..3&gt; \
+  --dist-init-addr &lt;PREFILL_MASTER_IP&gt;:5757 \
+  --moe-a2a-backend deepep --deepep-mode normal \
+  --ep-dispatch-algorithm dynamic --eplb-algorithm deepseek \
+  --chunked-prefill-size 16384 --mem-fraction-static 0.85 \
+  --page-size 64 --watchdog-timeout 3600</code></pre>
+
+<h4>9.3 Decode 8 节点启动（每节点改 --node-rank）</h4>
+<pre><code>python3 -m sglang.launch_server \
+  --model-path /models/&lt;MODEL_NAME&gt; \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device &lt;16个rdmap设备&gt; \
+  --host 0.0.0.0 --port 30001 --trust-remote-code \
+  --tp-size 64 --dp-size 64 --enable-dp-attention \
+  --nnodes 8 --node-rank &lt;0..7&gt; \
+  --dist-init-addr &lt;DECODE_MASTER_IP&gt;:5757 \
+  --moe-a2a-backend deepep --deepep-mode low_latency \
+  --ep-dispatch-algorithm dynamic --eplb-algorithm deepseek \
+  --mem-fraction-static 0.74 --cuda-graph-max-bs 16 \
+  --max-running-requests 1024 \
+  --page-size 64 --prefill-round-robin-balance \
+  --watchdog-timeout 1200</code></pre>
+
+<div class="box warn">
+<b>&#9888;&#65039; 大 DP / 大 EP 的三个已知关口</b>
+<ul style="margin:4px 0">
+<li><b>Mooncake DP&gt;1 修复</b>：dp64 强依赖镜像内 Mooncake ≥ v0.3.11.post1（PR #2023）。老镜像会出现 "Re-establish" 日志刷屏、decode 吞吐塌陷 —— 升级镜像即解。</li>
+<li><b>UCCL buffer 配置</b>：rank 数升到 32+ 后如遇 dispatch 超时，参考 eks-h200-deepseek-v4-pd.skill 的做法调大 <code>deep_ep/buffer.py</code> 中对应 rank 档位的 <code>num_max_dispatch_tokens</code>（128→512），并同步 <code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512</code>。64-rank 档位需按同样思路实测调参。</li>
+<li><b>DP idle-batch 死锁</b>：PD 分离 + DP attention 组合下，某 DP rank 空转时可能卡 all_gather（上游 sglang bug）。eks-h200-deepseek-v4-pd.skill 提供 <code>patch_disagg_decode_deadlock.py</code>（给 <code>prepare_mlp_sync_batch_raw</code> 补 <code>is_idle()</code> 分支）；若在 0.5.10 上复现同样卡死症状，按该 patch 思路处理。</li>
+</ul>
+</div>
+
+<h4>9.4 dp64 与请求长度的容量关系</h4>
+<p>DP attention 下<b>单个请求只落在一个 DP rank</b>（不跨 rank 切分），单请求最大输入长度受
+<i>单 rank KV pool</i> 限制而非集群总量。eks-h200-deepseek-v4-pd.skill 在 dp16 实测中单 rank
+<code>max_total_num_tokens≈44800</code> 即为单请求上限。dp64 时单 rank pool 更小，长文场景需实测
+<code>max_total_num_tokens</code>（启动日志打印）并据此设定业务侧输入上限，或降低 dp 换取更大单 rank pool。</p>
+
+<h4>9.5 更长期的扩展路径：机型升级与整组复制</h4>
+
+<div class="box key">
+<b>&#128161; 建议：超过 750B 的模型使用 p6-b300（B300）</b>
+<p style="margin:6px 0">
+p5en 单节点 8× H200 = <b>1.128TB</b> HBM。750B 级 FP8 权重（如 GLM-5.1 754GB）加载后剩余
+显存已非常紧张，长 context / 大 batch 下 KV cache 空间不足，只能靠收缩 context、压低并发来换稳定。
+<b>p6-b300.48xlarge（8× B300 288GB = 2.3TB/节点，约 2 倍于 p5en）</b>同样权重加载后 KV cache
+余量宽裕，长文本推理（120K+ 输入）场景收益显著。
+</p>
+<p style="margin:6px 0">换 B300 需注意的软件栈差异（来源 efa-validation BUILD_MATRIX B300 stack）：</p>
+<ul style="margin:4px 0">
+<li>SGLang 需 <b>≥ 0.5.12.post1</b>（首个官方支持 B300 的版本），镜像用 <code>Dockerfile.customer-b300</code> 构建（非 h200 版）</li>
+<li>attention backend 必须 <code>--attention-backend flashinfer</code>（<b>不能用 fa3</b>，无 sm_103 支持）</li>
+<li>UCCL 需含 PR #950（修 B300 上 16 EFA 双 NIC/GPU 的选卡逻辑，否则 proxy init 直接 SIGABRT）</li>
+<li>启动模板网卡布局不同：p6-b300 为 <b>card 0 纯 ENA（不承载 EFA）+ card 1-16 各一个 EFA</b>；
+  p5en 的 card 0 是 ENA(dev0)+EFA(dev1) 双接口——B300 的 card 0 上<b>没有</b> dev1 EFA</li>
+<li>Mooncake TE 版本不变（v0.3.11.post1），构建时加 <code>CUDA_ARCHITECTURES="100;103"</code></li>
+</ul>
+</div>
+
+<div class="box key">
+<b>&#128161; 负载均衡 / 数据并行扩容：机器数量翻倍（8 → 16），其他都不变</b>
+<p style="margin:6px 0">
+单个服务组（4P + 8D）的吞吐达到上限后，横向扩容方式是<b>整组复制</b>：再开一组完全相同的
+Prefill + Decode 集群，机器从 8 台翻倍到 16 台。<b>所有配置零改动</b>——启动模板、镜像、
+SGLang 启动参数、并行策略（pp4/tp8/ep32 + dp64/ep64）全部原样复用，只需：
+</p>
+<ul style="margin:4px 0">
+<li>CB 购买量 / IaC 实例数翻倍（<code>instance_count</code> 8 → 16）</li>
+<li>第二组用独立的 <code>dist-init-addr</code>（两组互不感知，无跨组通信）</li>
+<li>router 层做请求分发：sglang_router 支持多组 <code>--prefill</code>/<code>--decode</code> 地址，
+或在两个 router 前挂一层 NLB/ALB 做负载均衡</li>
+</ul>
+<p style="margin:6px 0">
+整组复制优于继续加大单组并行规模（如 dp64→dp128）：不引入新的通信半径和调参风险，
+故障域隔离（一组挂掉另一组照常服务），容量线性可预期。
+</p>
+</div>
+
+<h3 id="s10"><span class="step-num">10</span>压测与排障速查</h3>
+
+<h4>10.1 基准压测</h4>
+<pre><code># 对 router 端到端压测（参考 2p2d skill 固定参数: 随机数据集, rate 1→32 递增）
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host &lt;ROUTER_IP&gt; --port 8000 \
+  --dataset-name random \
+  --num-prompts 100 \
+  --random-input-len 2048 --random-output-len 256 --random-range-ratio 0.5 \
+  --max-concurrency &lt;rate&gt; --request-rate &lt;rate&gt;
+
+# Mooncake TE 裸带宽（镜像自带工具, 两节点各起一端）
+/opt/mooncake/install/bin/transfer_engine_bench --help
+# Mooncake EFA 单元测试（10 个 gtest 子项）
+/opt/mooncake/install/bin/efa_transport_test</code></pre>
+
+<h4>10.2 性能预期：EFA/SRD vs 自建 RoCE（迁移基准参考）</h4>
+<p>若客户从自建 ConnectX/RoCE 机房迁移，可参考 AWS Summit 2026《750B MoE 分离推理：从 RoCE 到 EFA 的全栈验证》
+（GLM-5.1 750B / 256 Expert / Top-8，SGLang，2P2D 4× p5en H200，120K 长文本输入）实测结论设定预期：</p>
+<table>
+<tr><th>指标</th><th>RoCE → EFA 变化</th><th>解读</th></tr>
+<tr><td>TTFT（首 token）</td><td>+9%</td><td>Prefill 计算密集，网络非瓶颈</td></tr>
+<tr><td>TPOT（每 token）</td><td>+31%</td><td>Decode MoE 每步 ~150 次小消息累积，单次差 ~28μs</td></tr>
+<tr><td>Max ITL（尾延迟）</td><td><b>−73%</b>（434→117ms，好 3.7×）</td><td>SRD 多路径喷射负载均衡，尾延迟显著优于 RoCE ECMP</td></tr>
+</table>
+<p>要点：平均 token 延迟略高属预期（SRD 与 RoCE 协议路径差异），但<b>尾延迟大幅改善</b>——
+线上 SLA 通常由 P99 决定，长文本高并发场景整体体验更稳。且 EFA 无需 PFC/ECN 专用交换机配置，运维复杂度远低于自建 RoCE。</p>
+
+<h4>10.3 故障速查表</h4>
+<table>
+<tr><th>症状</th><th>根因</th><th>处置</th></tr>
+<tr><td>KV 传输分钟级延迟，日志 <code>Installing TCP transport</code></td><td>sglang 给 Mooncake 传了 "rdma" 协议，EFA 构建回落 TCP</td><td>用 <code>2026.04.28-h200.3</code> 之后的镜像（补丁已内置）；自建镜像勿删 Dockerfile 中的 sed 补丁段</td></tr>
+<tr><td>NCCL <code>no socket interface found</code></td><td><code>NCCL_SOCKET_IFNAME</code> 与实际接口名不符</td><td>hostNetwork Pod 用 <code>enp</code>；CNI 网络 Pod 用 <code>eth0</code></td></tr>
+<tr><td><code>ImportError: DeepEP is not installed</code></td><td>deep_ep 包残缺或未指向 uccl</td><td><code>python -c "import deep_ep; print(deep_ep.Config.__module__)"</code> 应以 <code>uccl</code> 开头；否则重装镜像内 wheel</td></tr>
+<tr><td>decode #running 掉到 1、"Re-establish" 刷屏</td><td>Mooncake DP&gt;1 endpoint 键冲突（PR #2023 前）</td><td>换 <code>2026.05.02-h200.dp16</code> 及以后镜像</td></tr>
+<tr><td><code>Page size mismatch</code> crash</td><td>P/D 两侧 page-size 不一致</td><td>两侧都写 <code>--page-size 64</code></td></tr>
+<tr><td><code>DeepEP error: timeout (dispatch CPU)</code></td><td>RDMA 压力过大（如开了 two-batch-overlap）或 dispatch tokens 不足</td><td>勿用 <code>--enable-two-batch-overlap</code>（UCCL-EP 上不兼容）；按 §9.3 调 dispatch tokens</td></tr>
+<tr><td>UCCL-EP proxy 在 CUDA graph 捕获时 segfault</td><td>dispatch/combine 进入 graph 上下文</td><td>兜底加 <code>--disable-cuda-graph</code>（降吞吐），并跟进 UCCL 上游修复</td></tr>
+<tr><td>Pod 长时间 ContainerCreating</td><td>11GB+ 镜像现场拉取</td><td>提前每节点 <code>docker pull + ctr -n k8s.io images import</code></td></tr>
+<tr><td>只重启 P 或 D 一侧后 KV 传输报错</td><td>RDMA channel 状态残留</td><td>P/D <b>成对重启</b></td></tr>
+<tr><td>跨节点 Pod IP 不通（用 VPC CNI 时）</td><td>CNI 往 EFA ENI 分配了 secondary IP / FORWARD 链 DROP</td><td><code>MAX_ENI=1</code> + <code>WARM_ENI_TARGET=0</code>；<code>iptables -P FORWARD ACCEPT</code> 并持久化</td></tr>
+<tr><td>启动极慢（&gt;30 分钟）</td><td>DeepGEMM/Triton JIT 冷缓存 + CUDA graph 捕获</td><td>正常现象（2p2d skill 实测冷启 30-35 分钟）；JIT 缓存目录持久化后二次启动 ~5 分钟</td></tr>
+</table>
+
+<h4>10.4 交付物清单</h4>
+<table>
+<tr><th>路径</th><th>内容</th></tr>
+<tr><td><code>terraform/</code></td><td>方案 A 全套：main.tf / variables.tf / outputs.tf / userdata.sh.tpl / terraform.tfvars.example</td></tr>
+<tr><td><code>cloudformation/p5en-cb-cluster.yaml</code></td><td>方案 B 模板（已通过 validate-template）</td></tr>
+<tr><td><code>p5en-inference-deployment.html</code></td><td>本文档</td></tr>
+</table>
+
+<footer>
+参考来源：
+<a href="https://github.com/KevinZhao/efa-validation">KevinZhao/efa-validation</a>（Dockerfile.customer-h200 / BUILD_MATRIX.md / customer_glm_5.1 / setup-nvme.sh）·
+<a href="https://github.com/aws-samples/sample-eks-enterprise-quickstart">aws-samples/sample-eks-enterprise-quickstart</a>（eks-gpu-nodegroup LT / userdata / eks-gpu-stack）·
+<a href="https://github.com/yuhuiaws/ML-study">yuhuiaws/ML-study</a>（sglang-2p2d-ucclep-nixl.skill / eks-h200-deepseek-v4-pd.skill）·
+本地 ec2-self-k8s-GPU-kubeflow.skill（自建 K8s + EFA device plugin 踩坑集）·
+《750B MoE 分离推理：从 RoCE 到 EFA 的全栈验证》（AWS Summit 2026 上海，倪惠青 / 赵克鸣）。
+生成日期 2026-07-03。所有版本 pin 与命令均取自上述仓库实际内容，未经现场验证的推断处已在文中显式标注（§9 扩容参数、64-rank 调参）。
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>p5en 节点 UserData 说明 · 开机自动做了什么</title>
+<style>
+  :root {
+    --primary: #232f3e; --accent: #ff9900; --bg: #fafafa;
+    --border: #d5d9dd; --key-bg: #e8f4fd; --key-border: #2e86c1;
+    --warn-bg: #fff8e6; --warn-border: #f0ad4e;
+    --ok-bg: #eafaf1; --ok-border: #27ae60;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+         margin: 0; background: var(--bg); color: #222; line-height: 1.7; }
+  .container { max-width: 1060px; margin: 0 auto; padding: 24px 32px 80px; }
+  header { background: var(--primary); color: #fff; padding: 30px; }
+  header h1 { margin: 0 0 8px; font-size: 22px; }
+  header .sub { color: #ccc; font-size: 13.5px; }
+  h2 { color: var(--primary); border-bottom: 3px solid var(--accent);
+       padding-bottom: 6px; margin-top: 42px; font-size: 20px; }
+  h3 { color: var(--primary); margin-top: 24px; font-size: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; background:#fff; }
+  th, td { border: 1px solid var(--border); padding: 7px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--primary); color: #fff; font-weight: 600; }
+  tr:nth-child(even) { background: #f4f6f8; }
+  code { background: #eef0f3; padding: 1px 6px; border-radius: 4px;
+         font-family: "SF Mono",Menlo,Consolas,monospace; font-size: 12.5px; color: #c0392b; }
+  pre { background: #1e1e2e; color: #cdd6f4; padding: 14px 18px;
+        border-radius: 8px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .arch { background:#fff; border:1px solid var(--border); border-radius:8px; padding:16px; overflow-x:auto; }
+  .arch pre { background:#fff; color:#333; margin:0; font-size:12px; line-height:1.35; }
+  .box { border-left: 5px solid; border-radius: 6px; padding: 12px 16px; margin: 14px 0; font-size: 14px; }
+  .key  { background: var(--key-bg);  border-color: var(--key-border); }
+  .warn { background: var(--warn-bg); border-color: var(--warn-border); }
+  .ok { background: var(--ok-bg); border-color: var(--ok-border); }
+  .box b:first-child { display: block; margin-bottom: 4px; }
+  .stage { border: 1px solid var(--border); border-radius: 8px; background: #fff;
+           margin: 18px 0; padding: 4px 20px 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>p5en 节点 UserData 说明——开机自动做了什么</h1>
+  <div class="sub">适用于 www-h200-v12 CloudFormation / Terraform 模板 · 每台节点开机自动执行 · 全程无需人工干预</div>
+</header>
+<div class="container">
+
+<div class="box key">
+<b>&#128273; 一句话总结</b>
+UserData 在<b>每台节点首次开机时</b>自动完成 4 件事：<b>挂数据盘 → 装本地盘自愈服务 → 装 EFA 用户态 → 配 GPU 容器运行时</b>。
+执行约 3-5 分钟，全部日志在 <code>/var/log/p5en-bootstrap.log</code>。
+完成后节点即具备：持久数据盘 /data、28TB 高速本地盘 /mnt/nvme（容器数据自动落这里）、16 张 EFA 网卡可用、docker/containerd 可直接跑 GPU 容器。
+</div>
+
+<h2>1. 四个阶段做了什么</h2>
+
+<div class="stage">
+<h3>[1/4] EBS 数据盘 → /data（持久存储）</h3>
+<table>
+<tr><th>做什么</th><td>在 NVMe 总线上按型号 <code>Elastic Block Store</code> 找到那块空白的 2TB EBS 数据盘（跳过已有分区的根盘），格式化 xfs，挂载到 <code>/data</code>，按 UUID 写入 fstab</td></tr>
+<tr><th>为什么</th><td>模型分发中转、日志、JIT 缓存等需要<b>重启不丢</b>的数据放这里。stop/start 后自动重挂，数据保留</td></tr>
+<tr><th>结果</th><td><code>/data</code> ~2TB（含 models/ logs/ cache/ 三个预建目录），<b>持久</b></td></tr>
+</table>
+</div>
+
+<div class="stage">
+<h3>[2/4] 本地盘自愈服务（本模板的核心设计）</h3>
+<table>
+<tr><th>做什么</th><td>①带重试安装 mdadm（网络未就绪时最多等 5 分钟）②安装 systemd 服务 <code>setup-local-disks.service</code> 并立即执行一次</td></tr>
+<tr><th>服务干什么</th><td>把 8 块 3.5TB 本地 NVMe（instance-store）组 <b>RAID0 → 28TB ext4 → 挂 /mnt/nvme</b>，然后把 <code>/var/lib/docker</code> 和 <code>/var/lib/containerd</code> <b>bind 到 /mnt/nvme</b> 上——容器镜像/层全部落高速本地盘，不占也不拖慢根盘</td></tr>
+<tr><th>为什么是"服务"而不是一次性脚本</th><td>本地盘物理绑定宿主机，<b>stop/start 后是一组全新空盘</b>（RAID 和文件系统全没了）。做成每次开机都跑的 systemd 服务（排序在 docker/containerd <b>之前</b>），重启后自动重建 RAID + 重新 bind——<b>自愈</b>。盘上数据本身是临时的（丢失可接受），但磁盘布局永远自动恢复</td></tr>
+<tr><th>两种重启的区别</th><td><b>stop/start</b>（换宿主机）：全新空盘 → 服务重建 RAID（设备名 <code>md0</code>），盘上数据丢失；<b>reboot</b>（软重启，不换宿主机）：盘和数据都还在，内核开机时会把阵列自动组装成 <code>md127</code>，服务<b>探测并直接复用</b>该阵列（不重建不格式化）——<b>reboot 后 /mnt/nvme 数据保留</b>。所以看到设备名是 md0 或 md127 都正常</td></tr>
+<tr><th>安全设计</th><td>fail-fast：mdadm 缺失、或 /mnt/nvme 挂的不是 RAID 设备时服务直接失败退出（状态可见可告警），<b>绝不静默把容器数据写到根盘</b></td></tr>
+<tr><th>结果</th><td><code>/mnt/nvme</code> ~28TB（<b>临时</b>，重启清空但自动重建）；docker/containerd 数据目录已 bind</td></tr>
+</table>
+</div>
+
+<div class="stage">
+<h3>[3/4] EFA 用户态（固定版本 1.48.0）</h3>
+<table>
+<tr><th>做什么</th><td>下载并安装 aws-efa-installer <b>固定版本</b>（<code>--skip-kmod</code>：内核模块用 DLAMI 自带的，只装用户态 libfabric）</td></tr>
+<tr><th>为什么</th><td>宿主机与推理容器内 EFA 版本必须<b>对齐</b>（镜像内同为 1.48.0）；固定版本保证节点可重复构建</td></tr>
+<tr><th>结果</th><td><code>/opt/amazon/efa</code>，<code>fi_info -p efa</code> 可见 16 个设备</td></tr>
+</table>
+</div>
+
+<div class="stage">
+<h3>[4/4] GPU 容器运行时</h3>
+<table>
+<tr><th>做什么</th><td>确认 nvidia-container-toolkit，把 nvidia 注册为 <b>docker 和 containerd 两者</b>的默认运行时并重启服务；<code>nvidia-smi -pm 1</code> 开持久模式</td></tr>
+<tr><th>为什么</th><td>无论后续用 docker 直跑还是 K8s(containerd)，GPU 容器都开箱即用</td></tr>
+<tr><th>结果</th><td><code>docker run --gpus all ...</code> 直接可用</td></tr>
+</table>
+</div>
+
+<h2>2. 完成后的节点磁盘/网络布局</h2>
+<div class="arch"><pre>
+┌─ p5en.48xlarge 开机完成后 ──────────────────────────────────────────────┐
+│                                                                        │
+│  根盘 1TB EBS ─── / (OS, 不放业务数据)                                  │
+│  数据盘 2TB EBS ── /data          ◄─ 持久: 模型中转/日志/JIT缓存        │
+│  8× 3.5TB NVMe ── RAID0 /mnt/nvme ◄─ 28TB 高速; stop/start 清空+自动    │
+│                   (md0 或 md127)      重建, reboot 数据保留             │
+│                      ├─ bind → /var/lib/docker      (容器镜像/层)      │
+│                      ├─ bind → /var/lib/containerd  (K8s 场景同理)     │
+│                      └─ models/ (模型权重, 重启后需重新分发)            │
+│                                                                        │
+│  主 ENI ×1 (私有 IP, 经 NAT 出网) + efa-only ENI ×16 (RDMA, 节点间通信) │
+│  GPU: 8× H200 (nvidia runtime 已注册 docker+containerd)                │
+└────────────────────────────────────────────────────────────────────────┘
+</pre></div>
+
+<h2>3. 客户需要知道的三件事</h2>
+
+<div class="box warn">
+<b>&#9888;&#65039; ① 网络前提（开机前确认）</b>
+p5en 这类多网卡机型<b>开机时拿不到公网 IP</b>（EC2 限制：API 拒绝显式指定且忽略子网 auto-assign）。
+UserData 要下载 mdadm/EFA installer，因此节点所在子网必须<b>经 NAT Gateway 出网</b>（推荐），
+否则 UserData 网络步骤会失败。部署前跑 <code>preflight-cr.sh</code> 会自动检查这一项。
+</div>
+
+<div class="box warn">
+<b>&#9888;&#65039; ② /mnt/nvme 是临时盘（stop/start 后数据清空；reboot 保留）</b>
+<b>stop/start</b>（控制台 Stop 再 Start，换宿主机）：磁盘布局自动重建，但<b>盘上的数据不会回来</b>——模型权重需重新从
+S3 分发，容器镜像需重新拉取/导入。<b>reboot</b>（<code>sudo reboot</code> 或控制台 Reboot，不换宿主机）：
+数据保留，无需重新分发。需要持久的数据始终放 <code>/data</code>（EBS）。
+</div>
+
+<div class="box ok">
+<b>&#9989; ③ 开机后 1 分钟验证清单（每节点）</b>
+<pre style="margin:8px 0"><code>sudo tail -5 /var/log/p5en-bootstrap.log        # 末行 "p5en bootstrap complete"
+systemctl is-active setup-local-disks.service    # active (failed = 自愈服务拦截了异常, 看 journalctl)
+grep -c ^/dev/md /proc/mounts                    # 3 (/mnt/nvme + docker + containerd; 设备名 md0 或 md127 均正常)
+df -h /data /mnt/nvme                            # ~2T / ~28T
+/opt/amazon/efa/bin/fi_info -p efa -l | grep -c efa   # 16
+nvidia-smi -L | wc -l                            # 8
+docker run --rm --gpus all public.ecr.aws/docker/library/hello-world  # 容器运行时 OK</code></pre>
+</div>
+
+<h2>4. 排障速查</h2>
+<table>
+<tr><th>现象</th><th>原因</th><th>处理</th></tr>
+<tr><td>bootstrap.log 出现 <code>waiting for network to install mdadm</code> 多次后 FATAL</td><td>子网无出网（无 NAT）</td><td>修路由（NAT）后 <code>dnf install -y mdadm && systemctl restart setup-local-disks.service</code></td></tr>
+<tr><td><code>setup-local-disks.service</code> 状态 <code>failed</code></td><td>fail-fast 拦截（mdadm 缺失 / RAID 未成）——这是<b>设计行为</b>，防止数据静默写根盘</td><td><code>journalctl -u setup-local-disks.service</code> 看具体原因，修复后 restart 服务</td></tr>
+<tr><td><code>grep -c ^/dev/md /proc/mounts</code> 少于 3</td><td>bind 未完成</td><td>同上，restart 服务后 docker/containerd 也 restart</td></tr>
+<tr><td>reboot 后服务 <code>failed</code>、日志见 <code>Device or resource busy</code></td><td>脚本版本过旧（2026-07-07 前）：reboot 后内核已把阵列组装成 md127，旧脚本硬编码 md0 重建失败</td><td>更新 <code>setup-local-disks.sh</code> 到最新版（已支持探测复用 md127）后 restart 服务；数据仍在盘上不会丢</td></tr>
+<tr><td><code>fi_info</code> 无输出</td><td>EFA 安装失败或 SG 缺自引用规则</td><td>查 bootstrap.log [3/4] 段；确认 SG 自引用 ingress/egress</td></tr>
+<tr><td>stop/start 后 /mnt/nvme 有了但模型没了</td><td>预期行为（换宿主机=新空盘；注意 reboot 不属此情况）</td><td>从 S3 重新 sync 权重；镜像重新导入</td></tr>
+</table>
+
+<footer style="color:#888;font-size:12px;margin-top:60px;border-top:1px solid var(--border);padding-top:14px">
+对应源码: terraform/userdata.sh.tpl · cloudformation/p5en-cb-cluster.yaml (UserData 段) ·
+skills/www/scripts/setup-local-disks.sh (自愈服务可读源) · 设计背景与真机事故复盘见主文档 §4.7
+</footer>
+</div>
+</body>
+</html>

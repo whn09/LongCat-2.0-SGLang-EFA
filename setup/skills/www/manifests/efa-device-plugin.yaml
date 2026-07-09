@@ -1,0 +1,52 @@
+# AWS EFA device plugin — 自建 K8s 版
+# 镜像在需认证 ECR, 自建集群无 EKS 凭据链, 部署前每节点执行:
+#   REGION=us-east-2
+#   IMG="602401143452.dkr.ecr.${REGION}.amazonaws.com/eks/aws-efa-k8s-device-plugin:v0.5.7"
+#   aws ecr get-login-password --region $REGION | \
+#     docker login --username AWS --password-stdin 602401143452.dkr.ecr.${REGION}.amazonaws.com
+#   docker pull $IMG && docker save $IMG | sudo ctr -n k8s.io images import -
+# 注意: image 的 region 需与实际部署 region 一致 (修改下方 image 字段)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-efa-k8s-device-plugin
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: aws-efa-k8s-device-plugin
+  template:
+    metadata:
+      labels:
+        name: aws-efa-k8s-device-plugin
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      containers:
+        - name: aws-efa-k8s-device-plugin
+          image: 602401143452.dkr.ecr.us-east-2.amazonaws.com/eks/aws-efa-k8s-device-plugin:v0.5.7
+          imagePullPolicy: Never   # 镜像已预导入 containerd
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            # 缺 /dev/infiniband 和 /sys 会报 "No valid EFA devices found" 并 CrashLoop
+            - name: infiniband-devices
+              mountPath: /dev/infiniband
+            - name: sys
+              mountPath: /sys
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: infiniband-devices
+          hostPath:
+            path: /dev/infiniband
+        - name: sys
+          hostPath:
+            path: /sys

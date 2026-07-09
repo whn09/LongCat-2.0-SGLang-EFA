@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  p5en.48xlarge Capacity Block inference cluster.
+  17 NICs = 1 ENA primary (card0/dev0) + 16 EFA-only (card0/dev1 + card1-15/dev0),
+  1TB gp3 root + 2TB gp3 data, cluster placement group, self-referencing SG,
+  SSM + ECR IAM role. UserData: mount /data (EBS), RAID0 NVMe, pin EFA installer.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: p5en-inference
+    Description: Resource name prefix
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in the SAME AZ as the Capacity Block reservation
+  CapacityReservationId:
+    Type: String
+    AllowedPattern: '^cr-[0-9a-f]+$'
+    Description: Capacity Block reservation id (cr-xxxx)
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >
+      AL2023 Base Deep Learning AMI (NVIDIA driver + EFA + Docker). Lookup:
+      aws ssm get-parameter --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-amazon-linux-2023/latest/ami-id
+  KeyName:
+    Type: String
+    Default: ''
+    Description: EC2 key pair name (empty = no SSH key)
+  InstanceCount:
+    Type: Number
+    Default: 8
+    AllowedValues: [2, 4, 6, 8]
+    Description: Number of p5en nodes (4 for 2P2D test, 8 for full CB batch)
+  RootVolumeSize:
+    Type: Number
+    Default: 1024
+  DataVolumeSize:
+    Type: Number
+    Default: 2048
+  DataVolumeIops:
+    Type: Number
+    Default: 16000
+  DataVolumeThroughput:
+    Type: Number
+    Default: 1000
+  EfaInstallerVersion:
+    Type: String
+    Default: 1.48.0
+  AllowedSshCidr:
+    Type: String
+    Default: ''
+    Description: CIDR allowed to SSH (empty = no SSH ingress rule)
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  HasSshCidr: !Not [!Equals [!Ref AllowedSshCidr, '']]
+  Create3: !Or [!Equals [!Ref InstanceCount, 4], !Equals [!Ref InstanceCount, 6], !Equals [!Ref InstanceCount, 8]]
+  Create5: !Or [!Equals [!Ref InstanceCount, 6], !Equals [!Ref InstanceCount, 8]]
+  Create7: !Equals [!Ref InstanceCount, 8]
+
+Resources:
+  # -------------------------------------------------------------
+  # IAM
+  # -------------------------------------------------------------
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ClusterName}-node-profile'
+      Roles: [!Ref NodeRole]
+
+  # -------------------------------------------------------------
+  # Security Group: EFA requires self-referencing allow-all
+  # -------------------------------------------------------------
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: p5en nodes with EFA - self-referencing all traffic
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: outbound internet
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-node-sg' }
+
+  NodeSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: EFA/NCCL/K8s self-allow all
+
+  NodeSgSelfEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      DestinationSecurityGroupId: !Ref NodeSecurityGroup
+      Description: EFA self-egress (required by EFA docs)
+
+  NodeSgSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref AllowedSshCidr
+      Description: SSH from bastion
+
+  # -------------------------------------------------------------
+  # Placement group (cluster strategy for EFA low latency)
+  # -------------------------------------------------------------
+  ClusterPlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+
+  # -------------------------------------------------------------
+  # Launch Template: CB market options + reservation target +
+  # 16x EFA NICs + 1TB root + 2TB data
+  # -------------------------------------------------------------
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ClusterName}-p5en-lt'
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: p5en.48xlarge
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+        IamInstanceProfile:
+          Name: !Ref NodeInstanceProfile
+        InstanceMarketOptions:
+          MarketType: capacity-block
+        CapacityReservationSpecification:
+          CapacityReservationTarget:
+            CapacityReservationId: !Ref CapacityReservationId
+        Placement:
+          GroupName: !Ref ClusterPlacementGroup
+          Tenancy: default
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+          - DeviceName: /dev/xvdb
+            Ebs:
+              VolumeSize: !Ref DataVolumeSize
+              VolumeType: gp3
+              Iops: !Ref DataVolumeIops
+              Throughput: !Ref DataVolumeThroughput
+              Encrypted: true
+              DeleteOnTermination: true
+        # p5en.48xlarge 官方推荐布局 (efa-acc-inst-types.html):
+        #   card0/dev0 = ENA 主网卡 (主网卡不能是 efa-only)
+        #   card0/dev1 = efa-only  <- 容易漏! card0 也承载一个 EFA 设备
+        #   card1-15/dev0 = efa-only x15; 合计 1 ENA + 16 EFA
+        NetworkInterfaces:
+          - NetworkCardIndex: 0
+            DeviceIndex: 0
+            InterfaceType: interface
+            SubnetId: !Ref SubnetId
+            Groups: [!Ref NodeSecurityGroup]
+            DeleteOnTermination: true
+            # ⚠️ EC2 硬限制: 多网卡启动不允许 associatePublicIPAddress(API 400),
+            # 且忽略子网 MapPublicIpOnLaunch → 节点开机时无公网 IP。
+            # 出网必须二选一: ①子网路由走 NAT Gateway(推荐) ②开机后给主 ENI 挂 EIP。
+            # 无出网时 userdata 装 mdadm 会失败(已有 30x10s 重试+脚本 fail-fast 兜底)。
+          - { NetworkCardIndex: 0,  DeviceIndex: 1, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 1,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 2,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 3,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 4,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 5,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 6,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 7,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 8,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 9,  DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 10, DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 11, DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 12, DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 13, DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 14, DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+          - { NetworkCardIndex: 15, DeviceIndex: 0, InterfaceType: efa-only, SubnetId: !Ref SubnetId, Groups: [!Ref NodeSecurityGroup], DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${ClusterName}-p5en-node' }
+              - { Key: Project, Value: !Ref ClusterName }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${ClusterName}-p5en-volume' }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # p5en node bootstrap (container-only, no K8s):
+            #   [1] /data = EBS xfs (persistent)
+            #   [2] install self-heal systemd service: EVERY boot rebuilds local NVMe RAID0
+            #       and bind-mounts /var/lib/docker + /var/lib/containerd onto it
+            #       (local instance-store is wiped on stop/start, so this restores the fast
+            #        disk layout automatically; the data itself is ephemeral)
+            #   [3] EFA userspace (pinned)
+            #   [4] nvidia runtime for docker+containerd
+            set -ex
+            exec > >(tee /var/log/p5en-bootstrap.log) 2>&1
+
+            echo "=== [1/4] EBS data disk -> /data ==="
+            DATA_DISK=""
+            for i in $(seq 1 60); do
+              for sys_path in /sys/block/nvme*n1; do
+                [ -e "$sys_path" ] || continue
+                model=$(cat "$sys_path/device/model" 2>/dev/null | xargs)
+                case "$model" in *"Elastic Block Store"*) ;; *) continue ;; esac
+                dev="/dev/$(basename "$sys_path")"
+                if [ "$(lsblk -no NAME "$dev" | wc -l)" -eq 1 ] && [ -z "$(lsblk -no FSTYPE "$dev" | xargs)" ]; then
+                  DATA_DISK="$dev"; break 2
+                fi
+              done
+              echo "waiting for EBS data disk... ($i/60)"; sleep 1
+            done
+            if [ -n "$DATA_DISK" ]; then
+              mkfs.xfs -f "$DATA_DISK"
+              mkdir -p /data
+              mount -o noatime "$DATA_DISK" /data
+              UUID=$(blkid -s UUID -o value "$DATA_DISK")
+              grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /data xfs defaults,noatime,nofail 0 2" >> /etc/fstab
+              mkdir -p /data/models /data/logs /data/cache
+              chmod 1777 /data
+            else
+              echo "WARN: EBS data disk not found; /data unavailable"
+            fi
+
+            echo "=== [2/4] install local-disk self-heal service (rebuild RAID0 + bind docker/containerd every boot) ==="
+            # mdadm 是 RAID 硬前置; 开机初期网络可能未就绪(多网卡下无公网 IP 时更甚), 带重试
+            for i in $(seq 1 30); do
+              command -v mdadm >/dev/null && break
+              dnf install -y mdadm && break
+              echo "waiting for network to install mdadm... ($i/30)"; sleep 10
+            done
+            command -v mdadm >/dev/null || echo "FATAL: mdadm unavailable after retries; setup-local-disks.service will fail closed"
+            echo 'IyEvYmluL2Jhc2gKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBzZXR1cC1sb2NhbC1kaXNrcy5zaCAg4oCUICDmr4/mrKHlvIDmnLroh6rmhIjmnKzlnLAgTlZNZSDnm5gKIyDnlLEgc3lzdGVtZCDmnI3liqEgc2V0dXAtbG9jYWwtZGlza3Muc2VydmljZSDlnKggZG9ja2VyL2NvbnRhaW5lcmQg5LmL5YmN6L+Q6KGM44CCCiMKIyDog4zmma86IOacrOWcsCBOVk1lIChJbnN0YW5jZSBTdG9yZSkg54mp55CG57uR5a6a5a6/5Li75py6LCBzdG9wL3N0YXJ0IOWQjuaNouaWsOWuv+S4u+acugojID0g5LiA57uE5YWo5paw56m655uYIChSQUlEIOWFg+aVsOaNriArIOaWh+S7tuezu+e7n+WFqOayoeS6hinjgILmiYDku6Xlv4Xpobvmr4/mrKHlvIDmnLo6CiMgICAxLiDph43mlrDlj5HnjrDmnKzlnLDnm5ggLT4g57uEIFJBSUQwIC0+IG1rZnMgLT4g5oyCIC9tbnQvbnZtZQojICAgMi4gYmluZCAvdmFyL2xpYi9kb2NrZXIg5ZKMIC92YXIvbGliL2NvbnRhaW5lcmQg5YiwIC9tbnQvbnZtZSDkuIoKIyDorqkgZG9ja2VyL2NvbnRhaW5lcmQg5q+P5qyh6YO96JC95Zue6auY6YCf5pys5ZywIFJBSUQgKOebmOS4iuaVsOaNruacrOi6q+aYr+S4tOaXtueahCzkuKLlpLHlj6/mjqXlj5cp44CCCiMg5bmC562JOiDlt7LmjILovb0v5beyIGJpbmQg5YiZ6Lez6L+HLCDlj6/lronlhajph43lpI3ov5DooYzjgIIKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0Kc2V0IC11byBwaXBlZmFpbApsb2coKSB7IGVjaG8gIltzZXR1cC1sb2NhbC1kaXNrc10gJCoiOyB9CgpNTlQ9L21udC9udm1lCk1EPS9kZXYvbWQwICAgIyDpu5jorqTlkI0sIOS7heepuuebmOaWsOW7uuaXtuS9v+eUqDsgcmVib290IOWcuuaZr+S8muiiq+S4i+mdoueahOaOoua1i+imhueblgoKIyAxLiDlj5HnjrDmnKzlnLAgaW5zdGFuY2Utc3RvcmUgTlZNZSDnm5ggKOS8mOWFiOeos+WumueahCBieS1pZCwg5Zue6YCAIG1vZGVsIOWtl+espuS4sikKRElTS1M9KCkKaWYgWyAtZCAvZGV2L2Rpc2svYnktaWQgXTsgdGhlbgogIHdoaWxlIElGUz0gcmVhZCAtciBkOyBkbyBbIC1uICIkZCIgXSAmJiBESVNLUys9KCIkZCIpOyBkb25lIFwKICAgIDwgPChmaW5kIC1MIC9kZXYvZGlzay9ieS1pZC8gLXh0eXBlIGwgLW5hbWUgJypOVk1lX0luc3RhbmNlX1N0b3JhZ2VfKicgMj4vZGV2L251bGwgfCB4YXJncyAtciAtbjEgcmVhbHBhdGggfCBzb3J0IC11KQpmaQppZiBbICIkeyNESVNLU1tAXX0iIC1lcSAwIF07IHRoZW4KICBmb3IgcyBpbiAvc3lzL2Jsb2NrL252bWUqbjE7IGRvCiAgICBbIC1lICIkcyIgXSB8fCBjb250aW51ZQogICAgbT0kKGNhdCAiJHMvZGV2aWNlL21vZGVsIiAyPi9kZXYvbnVsbCB8IHRyIC1kICcgJykKICAgIGNhc2UgIiRtIiBpbiAqSW5zdGFuY2VTdG9yYWdlKikgRElTS1MrPSgiL2Rldi8kKGJhc2VuYW1lICIkcyIpIikgOzsgZXNhYwogIGRvbmUKZmkKaWYgWyAiJHsjRElTS1NbQF19IiAtZXEgMCBdOyB0aGVuCiAgbG9nICLmnKrlj5HnjrDmnKzlnLAgaW5zdGFuY2Utc3RvcmUgTlZNZSDnm5gsIOi3s+i/hyAoZG9ja2VyL2NvbnRhaW5lcmQg5bCG55So5qC555uYKSIKICBleGl0IDAKZmkKbG9nICLmnKzlnLDnm5g6ICR7RElTS1NbKl19IgoKIyBtZGFkbSDmmK/noazliY3nva46IOe8uuWkseaXtue7neS4jeiDvee7p+e7rei1sCBiaW5kIOWIhuaUrwojICgyMDI2LTA3LTA1IOecn+acuuS6i+aVhTog5YWs5pyJ5a2Q572R5peg5YWs572RIElQIOaXtiBkbmYg5ouJ5LiN5YiwIHJlcG8gLT4gbWRhZG0g57y65aSxCiMgIC0+IFJBSUQg5pyq5bu6IC0+IGJpbmQg5oqK5qC555uY55uu5b2V5oyC5LiKLCDmnI3liqHku40gYWN0aXZlLCDmlbDmja7pnZnpu5jokL3moLnnm5gpCmlmICEgY29tbWFuZCAtdiBtZGFkbSA+L2Rldi9udWxsOyB0aGVuCiAgbG9nICJGQVRBTDogbWRhZG0g5LiN5a2Y5ZyoLCDmi5Lnu53nu6fnu60gKOWQpuWImSBkb2NrZXIvY29udGFpbmVyZCDkvJrpnZnpu5jokL3moLnnm5gpIgogIGxvZyAi5L+u5aSNOiBkbmYgaW5zdGFsbCAteSBtZGFkbSAmJiBzeXN0ZW1jdGwgcmVzdGFydCBzZXR1cC1sb2NhbC1kaXNrcy5zZXJ2aWNlIgogIGV4aXQgMQpmaQoKIyAyLiDnu4Tlu7ov5oyC6L29IFJBSUQwIOWIsCAkTU5UICjluYLnrYkpCiMgcmVib290IOS4jiBzdG9wL3N0YXJ0IOaYr+S4pOadoei3r+W+hDoKIyAgIC0gc3RvcC9zdGFydCDmjaLlrr/kuLvmnLogPSDlhajmlrDnqbrnm5ggLT4gYXNzZW1ibGUg5aSx6LSlIC0+IGNyZWF0ZSAkTUQKIyAgIC0gcmVib290IOS4jeaNouWuv+S4u+acuiwg55uY5LiK6LaF57qn5Z2X6L+Y5ZyoLCDlhoXmoLjlnKjmnKzmnI3liqHov5DooYzliY3lsLHlt7LmiorpmLXliJcKIyAgICAg6Ieq5Yqo57uE6KOF5oiQIC9kZXYvbWQxMjcgKDIwMjYtMDctMDcg55yf5py65a6e6ZSkOiDnoaznvJbnoIEgbWQwIOaXtiBjcmVhdGUg5oqlCiMgICAgIERldmljZSBvciByZXNvdXJjZSBidXN5IC0+IOacjeWKoSBmYWlsIC0+IOacrOWcsOebmOaVtOi9ruacquiiq+S9v+eUqCkKIyAgIC0+IOaJgOS7peWFiOaOoua1i+i/meS6m+ebmOaYr+WQpuW3suWxnuS6juafkOS4qiBtZCDorr7lpIcsIOacieWwseebtOaOpeeUqOeOsOaIkOeahApFWElTVElOR19NRD0iIgpmb3IgZCBpbiAiJHtESVNLU1tAXX0iOyBkbwogICMgLXIg5b+F6aG7OiDpu5jorqTovpPlh7rluKbmoJHlvaLlrZfnrKYo4pSU4pSAbWQxMjcpLCDmi7zkuI3lh7rlkIjms5Xorr7lpIfot6/lvoQKICBFWElTVElOR19NRD0kKGxzYmxrIC1ybm8gTkFNRSxUWVBFICIkZCIgMj4vZGV2L251bGwgfCBhd2sgJyQyIH4gL15yYWlkLyB7cHJpbnQgJDE7IGV4aXR9JykKICBbIC1uICIkRVhJU1RJTkdfTUQiIF0gJiYgeyBNRD0iL2Rldi8kRVhJU1RJTkdfTUQiOyBsb2cgIuajgOa1i+WIsOW3sue7hOijhemYteWIlyAkTUQgKHJlYm9vdCDlnLrmma8pLCDnm7TmjqXlpI3nlKgiOyBicmVhazsgfQpkb25lCmlmIG1vdW50cG9pbnQgLXEgIiRNTlQiOyB0aGVuCiAgbG9nICIkTU5UIOW3suaMgui9vSwg6Lez6L+HIFJBSUQg57uE5bu6IgplbHNlCiAgIyDnu4QgYmluZCDliY3pnIDopoEgZG9ja2VyL2NvbnRhaW5lcmQg5pyq5Y2g55So5YW25pWw5o2u55uu5b2VOyDlvIDmnLrml7bmnI3liqHlnKjlroPku6zkuYvliY3ot5EsCiAgIyDov5nph4wgc3RvcCDkuLvopoHmmK/kuLrkuoblhZzkvY8i6aaW5ZCvIHVzZXJkYXRhIOmHjCBkb2NrZXIg5bey6Ieq5ZCvIueahOaDheW9ouOAggogIHN5c3RlbWN0bCBzdG9wIGRvY2tlciBjb250YWluZXJkIDI+L2Rldi9udWxsIHx8IHRydWUKICBpZiAhIG1kYWRtIC0tZGV0YWlsICIkTUQiID4vZGV2L251bGwgMj4mMTsgdGhlbgogICAgIyDlhajmlrDnqbrnm5g6IGFzc2VtYmxlIOS8muWksei0pSwg55u05o6lIGNyZWF0ZQogICAgbWRhZG0gLS1hc3NlbWJsZSAiJE1EIiAiJHtESVNLU1tAXX0iIDI+L2Rldi9udWxsIFwKICAgICAgfHwgbWRhZG0gLS1jcmVhdGUgLS1mb3JjZSAtLXJ1biAtLXZlcmJvc2UgIiRNRCIgLS1sZXZlbD0wIC0tcmFpZC1kZXZpY2VzPSIkeyNESVNLU1tAXX0iICIke0RJU0tTW0BdfSIKICAgIHNsZWVwIDIKICBmaQogIGlmIFsgLXogIiQobHNibGsgLW5vIEZTVFlQRSAiJE1EIiAyPi9kZXYvbnVsbCkiIF07IHRoZW4KICAgIG1rZnMuZXh0NCAtRiAtRSBub2Rpc2NhcmQsbGF6eV9pdGFibGVfaW5pdD0xLGxhenlfam91cm5hbF9pbml0PTEgLW0gMCAiJE1EIgogIGZpCiAgbWtkaXIgLXAgIiRNTlQiCiAgbW91bnQgLW8gbm9hdGltZSxub2RpcmF0aW1lICIkTUQiICIkTU5UIgogIGNobW9kIDE3NzcgIiRNTlQiCiAgbG9nICLlt7LmjILovb0gJE1EIC0+ICRNTlQiCmZpCgojIGZhaWwtZmFzdDogYmluZCDliY3lv4Xpobvnoa7orqQgJE1OVCDnnJ/nmoTmmK8gUkFJRCDorr7lpIcsIOmYsuatouS7u+S9leWksei0pei3r+W+hOaKiuagueebmOebruW9lSBiaW5kIOS4iuWOuwpTUkNfREVWPSQoZmluZG1udCAtbm8gU09VUkNFICIkTU5UIiAyPi9kZXYvbnVsbCkKaWYgWyAiJFNSQ19ERVYiICE9ICIkTUQiIF07IHRoZW4KICBsb2cgIkZBVEFMOiAkTU5UIOaMgui9vea6kOaYryAnJFNSQ19ERVYnIOiAjOmdniAkTUQsIOaLkue7nSBiaW5kICjmlbDmja7kvJrpnZnpu5jokL3moLnnm5gpIgogIGV4aXQgMQpmaQoKIyAzLiBiaW5kIGRvY2tlciArIGNvbnRhaW5lcmQg5pWw5o2u55uu5b2V5YiwIFJBSUQgKOW5guetiTsg6KaG55uW5a6i5oi355SoIGRvY2tlciDmiJYgY29udGFpbmVyZCDkuKTnp40pCmZvciBzdmMgaW4gZG9ja2VyIGNvbnRhaW5lcmQ7IGRvCiAgc3JjPS92YXIvbGliLyRzdmMKICBkc3Q9JE1OVC8kc3ZjCiAgbWtkaXIgLXAgIiRkc3QiICIkc3JjIgogIGlmIG1vdW50cG9pbnQgLXEgIiRzcmMiOyB0aGVuCiAgICBsb2cgIiRzcmMg5beyIGJpbmQsIOi3s+i/hyIKICBlbHNlCiAgICBzeXN0ZW1jdGwgc3RvcCAiJHN2YyIgMj4vZGV2L251bGwgfHwgdHJ1ZQogICAgbW91bnQgLS1iaW5kICIkZHN0IiAiJHNyYyIKICAgIGxvZyAiYmluZCAkZHN0IC0+ICRzcmMiCiAgZmkKZG9uZQoKbG9nICLlrozmiJA6IGRvY2tlciAmIGNvbnRhaW5lcmQgLT4gJE1OVC97ZG9ja2VyLGNvbnRhaW5lcmR9Igo=' | base64 -d > /usr/local/sbin/setup-local-disks.sh
+            chmod +x /usr/local/sbin/setup-local-disks.sh
+            cat > /etc/systemd/system/setup-local-disks.service <<'UNIT'
+            [Unit]
+            Description=Rebuild local NVMe RAID0 and bind docker/containerd data dirs (self-heal on every boot)
+            DefaultDependencies=no
+            Wants=systemd-udev-settle.service
+            After=systemd-udev-settle.service local-fs.target
+            Before=docker.service containerd.service
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/usr/local/sbin/setup-local-disks.sh
+            StandardOutput=journal+console
+            StandardError=journal+console
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable setup-local-disks.service
+            systemctl start setup-local-disks.service
+
+            echo "=== [3/4] EFA userspace ${EfaInstallerVersion} ==="
+            if [ ! -x /opt/amazon/efa/bin/fi_info ] || ! /opt/amazon/efa/bin/fi_info --version | grep -q "${EfaInstallerVersion}"; then
+              cd /tmp
+              curl -fsSLO "https://efa-installer.amazonaws.com/aws-efa-installer-${EfaInstallerVersion}.tar.gz"
+              tar -xf "aws-efa-installer-${EfaInstallerVersion}.tar.gz"
+              cd aws-efa-installer
+              ./efa_installer.sh -y --skip-kmod 2>&1 | tail -20 || echo "WARN: efa_installer failed"
+            fi
+            /opt/amazon/efa/bin/fi_info -p efa -l || echo "WARN: no EFA devices visible yet"
+
+            echo "=== [4/4] container runtime: nvidia runtime for docker+containerd (data dirs already bound to RAID) ==="
+            command -v nvidia-ctk >/dev/null || dnf install -y nvidia-container-toolkit || true
+            nvidia-ctk runtime configure --runtime=docker --set-as-default 2>/dev/null || true
+            nvidia-ctk runtime configure --runtime=containerd --set-as-default 2>/dev/null || true
+            systemctl enable docker containerd 2>/dev/null || true
+            systemctl restart containerd 2>/dev/null || true
+            systemctl restart docker 2>/dev/null || true
+            nvidia-smi -pm 1 || true
+
+            echo "=== p5en bootstrap complete ==="
+
+  # -------------------------------------------------------------
+  # Instances (CFN has no count; instances gated by InstanceCount)
+  # Node1/2 always; 3/4 at >=4; 5/6 at >=6; 7/8 at 8
+  # -------------------------------------------------------------
+  # 注意: CloudFormation 不支持 YAML 锚点, 每台实例显式声明
+  Node1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-1' }
+  Node2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-2' }
+  Node3:
+    Type: AWS::EC2::Instance
+    Condition: Create3
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-3' }
+  Node4:
+    Type: AWS::EC2::Instance
+    Condition: Create3
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-4' }
+  Node5:
+    Type: AWS::EC2::Instance
+    Condition: Create5
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-5' }
+  Node6:
+    Type: AWS::EC2::Instance
+    Condition: Create5
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-6' }
+  Node7:
+    Type: AWS::EC2::Instance
+    Condition: Create7
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-7' }
+  Node8:
+    Type: AWS::EC2::Instance
+    Condition: Create7
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-p5en-8' }
+
+Outputs:
+  SecurityGroupId:
+    Value: !Ref NodeSecurityGroup
+  LaunchTemplateId:
+    Value: !Ref NodeLaunchTemplate
+  PlacementGroup:
+    Value: !Ref ClusterPlacementGroup
+  Node1PrivateIp:
+    Value: !GetAtt Node1.PrivateIp
+  Node2PrivateIp:
+    Value: !GetAtt Node2.PrivateIp
+  Node3PrivateIp:
+    Condition: Create3
+    Value: !GetAtt Node3.PrivateIp
+  Node4PrivateIp:
+    Condition: Create3
+    Value: !GetAtt Node4.PrivateIp
+  Node5PrivateIp:
+    Condition: Create5
+    Value: !GetAtt Node5.PrivateIp
+  Node6PrivateIp:
+    Condition: Create5
+    Value: !GetAtt Node6.PrivateIp
+  Node7PrivateIp:
+    Condition: Create7
+    Value: !GetAtt Node7.PrivateIp
+  Node8PrivateIp:
+    Condition: Create7
+    Value: !GetAtt Node8.PrivateIp
