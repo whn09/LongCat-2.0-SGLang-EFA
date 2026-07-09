@@ -1,0 +1,127 @@
+# UCCL-EP + EFA on top of SGLang official image (p5/p5en.48xlarge / sm_90)
+#
+# Same EFA + Mooncake stack as Dockerfile.sglang-efa, but the multi-node MoE
+# all-to-all backend is UCCL-EP (uccl-project/uccl) built from source for cu13 +
+# EFA, INSTEAD OF DeepEP/NVSHMEM. No NVSHMEM, no DeepEP here.
+#
+# Stack:
+#   - Base:     lmsysorg/sglang:nightly-dev-cu13-20260708-b3632494
+#               (>= 2026-07-07 nightly; includes PR #30275 "Support LongCat 2.0 FP8".
+#                MUST be a cu13 build: LongCat-2.0's NSA/DSA path imports `cutlass`
+#                from nvidia-cutlass-dsl[cu13]==4.5.2 — the cu12 image ships an empty
+#                cutlass and silently falls back to a broken Transformers impl.)
+#   - EFA:      aws-efa-installer (libfabric + EFA provider)
+#   - GDRCopy:  GPU memreg for EFA VRAM transfer
+#   - Mooncake: kvcache-ai @ main, -DUSE_EFA=ON -DUSE_CUDA=ON (for PD KV transfer)
+#   - UCCL-EP:  uccl-project/uccl @ main + PR #828 empty-tensor fix, EFA build
+#
+# Build (context = repo root, so patch_uccl_ep_empty_tensor.sh is COPY-able):
+#   docker build -t ucclep-sglang-efa:latest -f Dockerfile.sglang-ucclep .
+
+ARG SGLANG_BASE=lmsysorg/sglang:nightly-dev-cu13-20260708-b3632494
+FROM ${SGLANG_BASE}
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+        git cmake build-essential wget curl \
+        libgflags-dev autoconf automake libtool \
+    && true
+
+# ---- GDRCopy (GPU memreg for EFA, required by Mooncake EFA) ----
+ARG GDRCOPY_VERSION=2.5.2
+RUN cd /tmp && \
+    wget -q https://github.com/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz && \
+    tar xf v${GDRCOPY_VERSION}.tar.gz && cd gdrcopy-${GDRCOPY_VERSION} && \
+    make -j$(nproc) lib lib_install CUDA=/usr/local/cuda PREFIX=/usr/local && \
+    rm -rf /tmp/gdrcopy* /tmp/v${GDRCOPY_VERSION}.tar.gz
+
+# ---- AWS EFA installer (libfabric + EFA provider) ----
+# Let the installer manage rdma-core (do NOT hand-install the bundled debs or pass
+# --skip-rdma-core) so rdma-core matches the libfabric it ships. --skip-kmod stays:
+# the EFA kernel module is provided by the host, not the container. apt index is
+# still present from the base layer above (not purged yet), so no apt-get update here.
+# NOTE: EFA 1.49 (libfabric 2.4.0amzn5.0) changed the default CUDA memory-registration
+# path to dmabuf, which fails to register one GPU rail (cuda:1, fi_mr_regattr
+# "Operation not supported", ret -202) on kernel 6.17-aws hosts — breaks Mooncake
+# KV-over-EFA. Runtime fix: env FI_HMEM_CUDA_USE_DMABUF=0 (set in serve-pd.sh).
+# Verify with scripts/mrtest-efa-gpu.py.
+RUN cd /tmp && \
+    curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz && \
+    tar xzf aws-efa-installer-latest.tar.gz && \
+    cd aws-efa-installer && \
+    ./efa_installer.sh -y --skip-kmod -g --no-verify
+
+# ---- Mooncake (for PD KV transfer over EFA; same as DeepEP image) ----
+RUN pip uninstall -y mooncake-transfer-engine mooncake 2>/dev/null || true
+RUN cd /tmp && \
+    git clone --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
+    cd Mooncake && git log --oneline -1 && \
+    bash dependencies.sh -y && \
+    apt-get install -y libgflags-dev && \
+    mkdir build && cd build && \
+    PYBIN=$(which python3) && \
+    PYINC=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))") && \
+    cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DPython3_EXECUTABLE="$PYBIN" -DPython3_INCLUDE_DIR="$PYINC" -DPython_EXECUTABLE="$PYBIN" && \
+    make -j$(nproc) && \
+    cp mooncake-integration/engine.cpython-*.so ../mooncake-wheel/mooncake/ && \
+    cp mooncake-integration/store.cpython-*.so ../mooncake-wheel/mooncake/ 2>/dev/null || true && \
+    cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/ && \
+    pip install ../mooncake-wheel --no-build-isolation && \
+    MCDIR=$(python3 -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))") && \
+    cp -v mooncake-integration/engine.cpython-*.so "$MCDIR/" && \
+    cp -v mooncake-integration/store.cpython-*.so "$MCDIR/" 2>/dev/null || true && \
+    cp -v mooncake-common/libasio.so "$MCDIR/" && \
+    rm -rf /tmp/Mooncake
+
+# ---- UCCL-EP: build from source for cu13 + EFA (replaces DeepEP for MoE a2a) ----
+# Includes PR #828 fix: handle empty tensors (topk_idx_ptr==0) in dispatch layout.
+RUN pip uninstall deep_ep deep-ep -y 2>/dev/null; \
+    rm -rf /sgl-workspace/DeepEP
+COPY patch_uccl_ep_empty_tensor.sh /tmp/patch_uccl_ep_empty_tensor.sh
+RUN apt-get update && \
+    pip install nanobind pybind11 && \
+    apt-get install -y rdma-core libibverbs-dev libnuma-dev patchelf && \
+    cd /tmp && \
+    git clone --recursive https://github.com/uccl-project/uccl.git && \
+    cd uccl && \
+    bash /tmp/patch_uccl_ep_empty_tensor.sh /tmp/uccl/ep/src/uccl_ep.cc && \
+    cd ep && \
+    EFA_HOME=/opt/amazon/efa TORCH_CUDA_ARCH_LIST="9.0+PTX" \
+    python setup.py build_ext --inplace && \
+    cd /tmp/uccl && \
+    pip install . && \
+    rm -rf /var/lib/apt/lists/*
+# Install uccl.ep .so into the uccl package directory
+RUN UCCL_DIR=$(python3 -c "import uccl; print(uccl.__path__[0])") && \
+    find /tmp/uccl/ep -name "ep.abi3.so" | head -1 | xargs -I{} cp -v {} "${UCCL_DIR}/" && \
+    ls -la "${UCCL_DIR}/ep.abi3.so" && \
+    cd /tmp/uccl/ep/deep_ep_wrapper && \
+    pip install --no-deps . && \
+    rm -rf /tmp/uccl
+
+# ---- LongCat-2.0 PD-disaggregation n-gram embedding fix ----
+# The disaggregation prefill/decode scheduler loops don't call
+# Scheduler._maybe_prepare_ngram_embedding, so batch.ne_token_table stays None and
+# LongCat-2.0's compute_n_gram_ids / update_token_table crash with
+# "Mismatched type ... Expected DLTensor* but got None" on every disagg TP rank.
+# This wires the prep call into all four disagg loops. Remove once upstream fixes it.
+COPY patch_longcat2_disagg_ngram.sh /tmp/patch_longcat2_disagg_ngram.sh
+RUN bash /tmp/patch_longcat2_disagg_ngram.sh /sgl-workspace/sglang/python/sglang/srt
+
+# ---- EFA runtime env ----
+ENV FI_PROVIDER=efa
+ENV FI_EFA_USE_DEVICE_RDMA=1
+ENV PATH="/opt/amazon/efa/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/opt/amazon/efa/lib:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+# ---- NCCL aws-ofi-nccl plugin path ----
+# EFA installer 1.49 on NGC-based images (sglang) installs the libnccl-ofi-ngc-v3
+# package, which ships ONLY libnccl-net-ofi.so — NOT the default name libnccl-net.so
+# that NCCL auto-loads. Without this, NCCL logs "NET/Plugin: Could not find:
+# libnccl-net.so" and falls back to TCP sockets (~14 GB/s vs ~400 GB/s over EFA),
+# which manifests as 3-5x slower prefill TTFT. Point NCCL directly at the plugin.
+ENV NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so
+
+WORKDIR /workspace
