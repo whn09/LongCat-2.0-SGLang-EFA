@@ -128,3 +128,40 @@ temperature=0。经 router（:8000）端到端。
 > 说明：本 benchmark 使用未含 Zero-Expert 优化的 UCCL-EP；LongCat-2.0 有 128 个 zero-computation
 > expert，客户生产版对 dispatch 做了 Zero-Expert 优化（路由到 zero-expert 的 token 跳过跨机
 > all-to-all），实际 decode 会更快。
+
+---
+
+# 长上下文（1M tokens）—— tp32/ep32 单实例（`scripts/serve-tp32-1m.sh`）
+
+在 4 节点 32 GPU 上单实例（非 PD 分离）跑通了**单请求 1,048,576 tokens（1M）prefill**。
+详见 `LONGCAT2_1M_CONTEXT.md`。
+
+## 支持 1M 的三个关键（缺一不可）
+
+| 配置 | 值 | 为什么必须 |
+|---|---|---|
+| 并行 | `--tp 32 --ep 32`（4 节点，无 CP） | ep32=tp32 → expert 完全 EP 分片，权重 1.6T/32≈50GB/卡（tp8 会 OOM）|
+| **KV dtype** | `--kv-cache-dtype fp8_e4m3` | fp8 让 KV 减半 → KV pool 达 1.23M token（bf16 只到 ~752K，装不下 1M）|
+| **attention kernel** | `--nsa-prefill-backend flashmla_kv` | fa3 内核不支持 fp8 KV（报 `query and key must have the same dtype`）；flashmla_kv 兼容 |
+
+外加：`--context-length 1048576` + env `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`（原生上限 256K，1M 需 YARN 外推）；
+`--mem-fraction-static 0.88`（不要 0.93，会在权重加载 OOM）；CP 必须关（sglang 的 CP 仅支持 tp≤8）。
+
+启动（4 节点各一条，head=节点0 内网 IP）：
+```bash
+TP=32 EP=32 CP=0 NNODES=4 CTX_LEN=1048576 CHUNK=8192 MEM_FRAC=0.88 \
+MAX_RUNNING=1 KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv \
+bash scripts/serve-tp32-1m.sh <node-rank 0..3> <head-ip>
+```
+
+## 1M prefill 性能（单请求）
+
+| chunked-prefill-size | 输入吞吐 | 1M 总耗时（约） | 说明 |
+|---|---|---|---|
+| 16384 | 1401 tok/s | ~12.5 min | flashmla_kv 触发 low-smem fallback（拖慢）|
+| **8192** | **1974 tok/s** | **~8.9 min** | 避开 fallback，+40% |
+
+- 更短上下文（≤512K）用 bf16 KV + fa3 更快：256K TTFT 51s（5144 tok/s）、512K TTFT 133s（3927 tok/s）。
+- **UCCL-EP vs DeepEP @1M**：1974 vs 1972 tok/s，**基本无差异** —— 1M prefill 瓶颈是 attention 的
+  O(n²) 计算（百万级 KV），MoE all-to-all 只占小部分，EP 后端差异被淹没。
+  （小消息 decode 场景 UCCL-EP 明显快于 DeepEP，是不同 regime。）
