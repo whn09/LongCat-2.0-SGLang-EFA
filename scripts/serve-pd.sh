@@ -41,6 +41,13 @@ DIST_PORT="${DIST_PORT:-20000}"
 # (0.92 OOMs at chunk 16384). Default here = 16384/0.85 for the prefill-focused sweep.
 CHUNK="${CHUNK:-16384}"
 MEM_FRAC="${MEM_FRAC:-0.85}"
+# context-length: MUST cap this. LongCat-2.0's native context is 256K; if left unset,
+# sglang sizes the KV pool for 256K and — after the ~107GB/GPU weights on tp16 — the KV
+# cache allocation fails, so the server hangs AFTER "Load weight end" and never reaches
+# "KV Cache is allocated"/"fired up" (looks like a load hang, but it's KV-pool OOM).
+# 131072 (128K) sizes the KV pool to ~62784 tokens (~5.7GB/rank) and starts cleanly.
+# Lower it further (e.g. 32768) if you need more KV headroom or higher concurrency.
+CTX_LEN="${CTX_LEN:-131072}"
 
 sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 sudo mkdir -p /opt/dlami/nvme/jit-cache
@@ -62,6 +69,7 @@ sudo docker run -d --name "$CONTAINER" --gpus all --network host --shm-size 64g 
     python3 -m sglang.launch_server \
       --model-path /models/LongCat-2.0-FP8 --trust-remote-code \
       --tp 16 --ep 16 --nnodes 2 --node-rank ${RANK} --dist-init-addr ${HEADIP}:${DIST_PORT} \
+      --context-length ${CTX_LEN} \
       --max-running-requests 64 --mem-fraction-static ${MEM_FRAC} \
       --chunked-prefill-size ${CHUNK} --nsa-prefill-backend fa3 --kv-cache-dtype bfloat16 \
       --moe-a2a-backend deepep --deepep-mode ${DEEPEP_MODE} \
