@@ -1,0 +1,70 @@
+diff --git a/python/sglang/srt/layers/n_gram_embedding.py b/python/sglang/srt/layers/n_gram_embedding.py
+index 5ec61f25d..263be0451 100644
+--- a/python/sglang/srt/layers/n_gram_embedding.py
++++ b/python/sglang/srt/layers/n_gram_embedding.py
+@@ -138,11 +138,20 @@ class NgramEmbedding(torch.nn.Module):
+             or forward_batch.forward_mode.is_decode()
+         ):
+             ngram_embedding_info = forward_batch.ngram_embedding_info
++            # NGRAM_BS_GUARD: the ngram_info arrays can be shorter than
++            # forward_batch.batch_size in mixed/overlap batches; drive the req loop
++            # off the array length so the kernel never reads column_starts/req_lens
++            # out of bounds (cudaErrorIllegalAddress).
++            _ng_bs = min(
++                forward_batch.batch_size,
++                ngram_embedding_info.req_lens.shape[0],
++                ngram_embedding_info.column_starts.shape[0],
++            )
+             torch.cumsum(
+-                ngram_embedding_info.req_lens,
++                ngram_embedding_info.req_lens[:_ng_bs],
+                 dim=0,
+                 dtype=torch.int32,
+-                out=self.exclusive_req_len_sums[1 : 1 + forward_batch.batch_size],
++                out=self.exclusive_req_len_sums[1 : 1 + _ng_bs],
+             )
+             compute_n_gram_ids(
+                 ne_n=self.over_embedding_n,
+@@ -151,12 +160,10 @@ class NgramEmbedding(torch.nn.Module):
+                 ne_mods=self.oe_mods,
+                 tokens=input_ids.to(torch.int32),
+                 exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
+-                exclusive_req_len_sums=self.exclusive_req_len_sums[
+-                    : forward_batch.batch_size + 1
+-                ],
++                exclusive_req_len_sums=self.exclusive_req_len_sums[: _ng_bs + 1],
+                 ne_token_table=ngram_embedding_info.token_table,
+-                row_indices=forward_batch.req_pool_indices,
+-                column_starts=ngram_embedding_info.column_starts,
++                row_indices=forward_batch.req_pool_indices[:_ng_bs],
++                column_starts=ngram_embedding_info.column_starts[:_ng_bs],
+                 n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                 eos_token_id=self.eos_token_id,
+             )
+diff --git a/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py b/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py
+index 71e8a3322..e3b2300d1 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py
++++ b/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py
+@@ -177,14 +177,17 @@ def update_ngram_token_table_after_sampling(
+         )
+         return True
+ 
+-    ngram_embedding_info.out_column_starts[:batch_size] = seq_lens
++    # NGRAM_BS_FIX: seq_lens / next_token_ids / req_pool_indices may be padded to the
++    # cuda-graph batch size while batch_size is the real request count. Slice to
++    # batch_size so padded rows don't pollute the token table (and shapes match).
++    ngram_embedding_info.out_column_starts[:batch_size] = seq_lens[:batch_size]
+     ngram_embedding_info.out_req_lens[:batch_size] = 1
+     update_token_table(
+         ne_token_table=ngram_embedding_info.token_table,
+-        tokens=next_token_ids.to(torch.int32),
+-        row_indices=req_pool_indices,
+-        column_starts=ngram_embedding_info.out_column_starts,
+-        req_lens=ngram_embedding_info.out_req_lens,
++        tokens=next_token_ids[:batch_size].to(torch.int32),
++        row_indices=req_pool_indices[:batch_size],
++        column_starts=ngram_embedding_info.out_column_starts[:batch_size],
++        req_lens=ngram_embedding_info.out_req_lens[:batch_size],
+         ignore_tokens=None,
+     )
+     return True

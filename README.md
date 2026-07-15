@@ -8,30 +8,48 @@ PD 分离（Prefill/Decode disaggregation）方案。
 
 | 文件 | 说明 |
 |---|---|
-| `Dockerfile.sglang-ucclep` | 镜像：nightly-cu13 + EFA 1.49 + GDRCopy + Mooncake + UCCL-EP（DeepEP 兼容 `deep_ep` wrapper，原生 EFA，无 NVSHMEM）+ `NCCL_NET_PLUGIN` 修复 |
-| `patch_uccl_ep_empty_tensor.sh` | 构建时补丁：UCCL-EP empty-tensor |
-| `patch_longcat2_disagg_ngram.sh` | 构建时补丁：把 n-gram embedding 接入 PD 分离调度循环 |
-| `scripts/serve-pd.sh` | 启动 Prefill / Decode 实例（tp16/ep16，deepep MoE over EFA） |
+| `Dockerfile.sglang-ucclep` | 镜像：nightly-cu13-20260715 + EFA 1.49 + GDRCopy + Mooncake + UCCL-EP（DeepEP 兼容 `deep_ep` wrapper，原生 EFA，无 NVSHMEM）+ `NCCL_NET_PLUGIN` 修复。**所有 LongCat 真-EP 修复以上游 PR diff 的形式在构建时 `git apply`**（见 `patches/`），不再用临时 sed 补丁 |
+| `patches/*.diff` | 上游 PR 的标准 diff（构建时 `git apply`）：sglang #30975/#31311/#31312/#31134 + UCCL #1020/#1021。每个都可追溯到一个 PR，PR 合并进 base 后即可删 |
+| `scripts/serve-pd.sh` | 启动 Prefill / Decode 实例（tp16/ep16，PD 分离；prefill=deepep normal，decode=deepep low_latency） |
+| `scripts/serve-tp16.sh` | 启动**单个非分离**实例（tp16/ep16 跨 2 节点）——只有 2 节点、无法跑 PD 时用它做正确性/并发测试；含 `smoke` 子命令 |
 | `scripts/serve-router.sh` | 启动 PD router |
 
 > 注：`--moe-a2a-backend deepep` 是 UCCL-EP 在 sglang 里的接口开关（UCCL-EP 提供 DeepEP 兼容
 > `deep_ep`），底层实际走 UCCL-EP 原生 EFA，**不是** NVSHMEM DeepEP。
 
+### 内置的上游修复（构建时 `git apply patches/*.diff`）
+
+让 LongCat-2.0 在真 EP（`--moe-a2a-backend deepep`）下**跑通且输出正确**所需的修复，均为标准上游 PR：
+
+| PR | 修什么 |
+|---|---|
+| sglang [#30975](https://github.com/sgl-project/sglang/pull/30975) | scheduler moe-topk gate（否则 `--moe-a2a-backend` 对 LongCat 静默失效） |
+| sglang [#31311](https://github.com/sgl-project/sglang/pull/31311) | MoE 后与 DeepEPMoE combine 的双重 all_reduce（乱码）+ ScMoE dense 分支 gather（RoPE 崩） |
+| sglang [#31312](https://github.com/sgl-project/sglang/pull/31312) | n-gram token-table 在 padded（cuda-graph）decode batch 下越界崩 |
+| sglang [#31134](https://github.com/sgl-project/sglang/pull/31134) | 把 n-gram 准备接入 PD 分离调度循环 |
+| UCCL [#1020](https://github.com/uccl-project/uccl/pull/1020) | internode TMA sender buffer 16384→20480（hidden=8192） |
+| UCCL [#1021](https://github.com/uccl-project/uccl/pull/1021) | WriteImm expert_idx 9→10 bit（768 expert，否则 LL 启动崩） |
+
+> 这些 PR 合并进上游 nightly 后，把 base tag 升到含它们的镜像、删掉对应 diff 即可。UCCL #1016（kNumMaxTopK）
+> 和 empty-tensor 修复已在 uccl main，无需 patch。
+
 ## 快速开始
 
 ```bash
-# 1. 构建镜像（context = repo 根，patch 脚本会被 COPY）
-docker build -f Dockerfile.sglang-ucclep -t ucclep-longcat2-efa149-v3 .
+# 1. 构建镜像（context = repo 根，patches/ 会被 COPY 并 git apply）
+docker build -f Dockerfile.sglang-ucclep -t ucclep-sglang-efa:latest .
 
-# 2. 启动 PD 分离（每节点一条命令）
-#    Prefill = 2 节点，Decode = 2 节点（各 tp16/ep16，模型 1.6T 需 16 GPU）
+# 2a. PD 分离（4 节点：Prefill 2 + Decode 2，各 tp16/ep16，模型 1.6T 需 16 GPU）
 bash scripts/serve-pd.sh prefill 0 <prefill_head_ip>   # prefill head
 bash scripts/serve-pd.sh prefill 1 <prefill_head_ip>   # prefill node1
 bash scripts/serve-pd.sh decode  0 <decode_head_ip>    # decode head
 bash scripts/serve-pd.sh decode  1 <decode_head_ip>    # decode node1
+bash scripts/serve-router.sh <prefill_ip> <decode_ip>  # 在 prefill head
 
-# 3. 在 prefill head 启动 router
-bash scripts/serve-router.sh <prefill_ip> <decode_ip>
+# 2b. 只有 2 节点时：单个非分离实例（跑正确性/并发测试）
+bash scripts/serve-tp16.sh 0 <head_ip>   # head
+bash scripts/serve-tp16.sh 1 <head_ip>   # node1
+bash scripts/serve-tp16.sh smoke         # 就绪后在 head 上
 ```
 
 关键 env / 参数（serve-pd.sh 已内置）：`MOONCAKE_PROTOCOL=efa`、`FI_HMEM_CUDA_USE_DMABUF=0`
@@ -53,8 +71,8 @@ bash scripts/serve-router.sh <prefill_ip> <decode_ip>
 | **Decode 实例** | P5EN-3(head) + P5EN-4 | tp16 / ep16 / nnodes2，deepep `low_latency` 模式 |
 | **Router** | P5EN-1 | round_robin，PD-disaggregation |
 
-- **镜像**：`ucclep-longcat2-efa149-v3`（**EFA installer 1.49** + `NCCL_NET_PLUGIN` 修复 baked-in，
-  避免 NCCL→TCP 回退）。
+- **镜像**：`ucclep-sglang-efa:latest`（base nightly-cu13-20260715 + **EFA installer 1.49** +
+  `NCCL_NET_PLUGIN` 修复 baked-in 避免 NCCL→TCP 回退 + `patches/*.diff` 的上游修复）。
 - **KV 传输**：Mooncake over EFA（`MOONCAKE_PROTOCOL=efa`，16 NIC 注册），
   `FI_HMEM_CUDA_USE_DMABUF=0`（绕过 1.49 dmabuf 在 cuda:1 的注册失败）。
 - **关键参数**：`--chunked-prefill-size 16384`、`--mem-fraction-static 0.85`

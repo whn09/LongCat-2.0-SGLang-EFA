@@ -24,14 +24,17 @@ HEADIP="${3:?usage: serve-pd.sh <prefill|decode> <node-rank 0|1> <group-head-ip>
 
 case "$ROLE" in
   # MoE all-to-all over UCCL-EP (DeepEP-compatible wrapper, EFA — no NVSHMEM):
-  #   prefill -> normal mode (throughput); decode -> low_latency (keeps CUDA graph on).
+  #   prefill -> normal mode (throughput; handles large chunks);
+  #   decode  -> low_latency (fixed-geometry dispatch keeps CUDA graph on -> GPU ~99%).
   prefill) PORT="${PORT:-8010}"; CONTAINER=sglang-prefill; DEEPEP_MODE="${DEEPEP_MODE:-normal}" ;;
   decode)  PORT="${PORT:-8020}"; CONTAINER=sglang-decode;  DEEPEP_MODE="${DEEPEP_MODE:-low_latency}" ;;
   *) echo "ROLE must be 'prefill' or 'decode'"; exit 1 ;;
 esac
 
-# v3 image = EFA installer 1.49 + NCCL_NET_PLUGIN baked in (fixes NCCL->TCP fallback).
-IMG="${IMG:-579019700964.dkr.ecr.us-east-2.amazonaws.com/ep-benchmarks-efa/uccl-ep-efa:ucclep-longcat2-efa149-v3}"
+# UCCL-EP image built from Dockerfile.sglang-ucclep (base nightly-20260715 + the
+# sglang/UCCL real-EP PR fixes baked in — no runtime patching needed). Override IMG
+# to point at your registry copy.
+IMG="${IMG:-ucclep-sglang-efa:latest}"
 MODEL_DIR="${MODEL_DIR:-/opt/dlami/nvme/LongCat-2.0-FP8}"
 IFACE="${IFACE:-$(ip -o -4 addr show | awk '$2!="lo" && $2!~"docker"{print $2; exit}')}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
@@ -48,6 +51,16 @@ MEM_FRAC="${MEM_FRAC:-0.85}"
 # 131072 (128K) sizes the KV pool to ~62784 tokens (~5.7GB/rank) and starts cleanly.
 # Lower it further (e.g. 32768) if you need more KV headroom or higher concurrency.
 CTX_LEN="${CTX_LEN:-131072}"
+# KV dtype + DSA kernel. Default bf16+fa3 (fastest for shorter contexts). For long
+# contexts (64K/128K) that need a bigger KV pool, use fp8 (pool ~2x) which REQUIRES
+# flashmla_kv (fa3 crashes on fp8: "query and key must have the same dtype"):
+#   KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv
+KV_DTYPE="${KV_DTYPE:-bfloat16}"
+DSA_BACKEND="${DSA_BACKEND:-fa3}"
+# UCCL/DeepEP low-latency dispatch per-rank token cap (decode role). Must be >= the
+# per-rank token count; default 128. Raising it grows the LL RDMA buffer (and can OOM
+# CUDA-graph capture), so keep it just above your decode batch. Only affects LL mode.
+DDT="${DDT:-128}"
 
 sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 sudo mkdir -p /opt/dlami/nvme/jit-cache
@@ -66,12 +79,14 @@ sudo docker run -d --name "$CONTAINER" --gpus all --network host --shm-size 64g 
     export FI_HMEM_CUDA_USE_DMABUF=0;
     export NCCL_SOCKET_IFNAME=${IFACE} GLOO_SOCKET_IFNAME=${IFACE};
     export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300;
+    export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1;
+    export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${DDT};
     python3 -m sglang.launch_server \
       --model-path /models/LongCat-2.0-FP8 --trust-remote-code \
       --tp 16 --ep 16 --nnodes 2 --node-rank ${RANK} --dist-init-addr ${HEADIP}:${DIST_PORT} \
       --context-length ${CTX_LEN} \
       --max-running-requests 64 --mem-fraction-static ${MEM_FRAC} \
-      --chunked-prefill-size ${CHUNK} --nsa-prefill-backend fa3 --kv-cache-dtype bfloat16 \
+      --chunked-prefill-size ${CHUNK} --nsa-prefill-backend ${DSA_BACKEND} --kv-cache-dtype ${KV_DTYPE} \
       --moe-a2a-backend deepep --deepep-mode ${DEEPEP_MODE} \
       --disable-radix-cache \
       --disaggregation-mode ${ROLE} \

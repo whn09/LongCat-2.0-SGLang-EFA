@@ -1,0 +1,48 @@
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 664af1f59..ec4f47707 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -2001,6 +2001,9 @@ class SchedulerDisaggregationDecodeMixin:
+             )
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
++            batch = self.ngram_embedding_manager.prepare_for_forward(
++                batch, chunked_req=self.chunked_req
++            )
+             self.cur_batch_for_debug = batch
+ 
+             # Launch the current batch
+@@ -2039,6 +2042,9 @@ class SchedulerDisaggregationDecodeMixin:
+             )
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
++            batch = self.ngram_embedding_manager.prepare_for_forward(
++                batch, chunked_req=self.chunked_req
++            )
+             self.cur_batch_for_debug = batch
+             # overlap + spec + grammar is unsupported (would desync DP ranks).
+             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index a4c14d784..43efa2db9 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -521,6 +521,9 @@ class SchedulerDisaggregationPrefillMixin:
+             )
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
++            batch = self.ngram_embedding_manager.prepare_for_forward(
++                batch, chunked_req=self.chunked_req
++            )
+             self.cur_batch_for_debug = batch
+ 
+             # Launch the current batch
+@@ -559,6 +562,9 @@ class SchedulerDisaggregationPrefillMixin:
+             )
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
++            batch = self.ngram_embedding_manager.prepare_for_forward(
++                batch, chunked_req=self.chunked_req
++            )
+             self.cur_batch_for_debug = batch
+ 
+             # Launch the current batch

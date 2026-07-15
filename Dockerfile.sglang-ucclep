@@ -5,20 +5,29 @@
 # EFA, INSTEAD OF DeepEP/NVSHMEM. No NVSHMEM, no DeepEP here.
 #
 # Stack:
-#   - Base:     lmsysorg/sglang:nightly-dev-cu13-20260708-b3632494
-#               (>= 2026-07-07 nightly; includes PR #30275 "Support LongCat 2.0 FP8".
-#                MUST be a cu13 build: LongCat-2.0's NSA/DSA path imports `cutlass`
-#                from nvidia-cutlass-dsl[cu13]==4.5.2 — the cu12 image ships an empty
-#                cutlass and silently falls back to a broken Transformers impl.)
+#   - Base:     lmsysorg/sglang:nightly-dev-cu13-20260715-50d1edaa
+#               (>= 2026-07-14: has #30387 zero-expert routed-id fix AND #31154
+#                NgramEmbeddingManager. Pinned by date so the git-apply'd PR diffs
+#                below keep matching. MUST be a cu13 build: LongCat-2.0's NSA/DSA path
+#                imports `cutlass` from nvidia-cutlass-dsl[cu13]==4.5.2 — the cu12
+#                image ships an empty cutlass and falls back to a broken impl.)
 #   - EFA:      aws-efa-installer (libfabric + EFA provider)
 #   - GDRCopy:  GPU memreg for EFA VRAM transfer
 #   - Mooncake: kvcache-ai @ main, -DUSE_EFA=ON -DUSE_CUDA=ON (for PD KV transfer)
-#   - UCCL-EP:  uccl-project/uccl @ main + PR #828 empty-tensor fix, EFA build
+#   - UCCL-EP:  uccl-project/uccl @ main + PR #1020 (TMA hidden=8192) + #1021
+#               (WriteImm expert_idx 9->10 bit) applied via git apply. (#1016 topk
+#               and the empty-tensor fix are already in uccl main.)
 #
-# Build (context = repo root, so patch_uccl_ep_empty_tensor.sh is COPY-able):
+# Fixes are applied as upstream-PR diffs (patches/*.diff via `git apply`) instead of
+# ad-hoc sed scripts, so each change is traceable to a PR and drops out once merged:
+#   sglang: #31311 (real-EP double all-reduce + ScMoE RoPE), #31312 (n-gram padded
+#           batch), #31134 (disagg n-gram wiring), #30975 (--moe-a2a-backend gate).
+#   uccl:   #1020, #1021.
+#
+# Build (context = repo root, so patches/ is COPY-able):
 #   docker build -t ucclep-sglang-efa:latest -f Dockerfile.sglang-ucclep .
 
-ARG SGLANG_BASE=lmsysorg/sglang:nightly-dev-cu13-20260708-b3632494
+ARG SGLANG_BASE=lmsysorg/sglang:nightly-dev-cu13-20260715-50d1edaa
 FROM ${SGLANG_BASE}
 
 USER root
@@ -76,17 +85,25 @@ RUN cd /tmp && \
     rm -rf /tmp/Mooncake
 
 # ---- UCCL-EP: build from source for cu13 + EFA (replaces DeepEP for MoE a2a) ----
-# Includes PR #828 fix: handle empty tensors (topk_idx_ptr==0) in dispatch layout.
+# Applies UCCL PRs before build_ext (constants bake into ep.abi3.so):
+#   #1020 (patches/uccl-pr-1020-tma-hidden8192.diff): raise internode TMA sender
+#         buffer 16384 -> 20480 so hidden=8192 fits (else prefill dispatch asserts).
+#   #1021 (patches/uccl-pr-1021-expert-idx-10bit.diff): widen WriteImm EXPERT_IDX
+#         9 -> 10 bit so LongCat-2.0's 768 routed experts fit the RDMA immediate
+#         (else LL combine aborts "expert_idx exceeds 9-bit limit (max 511)").
+# (#1016 kNumMaxTopK 9->16 and the empty-tensor fix are already in uccl main.)
 RUN pip uninstall deep_ep deep-ep -y 2>/dev/null; \
     rm -rf /sgl-workspace/DeepEP
-COPY patch_uccl_ep_empty_tensor.sh /tmp/patch_uccl_ep_empty_tensor.sh
+COPY patches/uccl-pr-1020-tma-hidden8192.diff /tmp/uccl-pr-1020.diff
+COPY patches/uccl-pr-1021-expert-idx-10bit.diff /tmp/uccl-pr-1021.diff
 RUN apt-get update && \
     pip install nanobind pybind11 && \
     apt-get install -y rdma-core libibverbs-dev libnuma-dev patchelf && \
     cd /tmp && \
     git clone --recursive https://github.com/uccl-project/uccl.git && \
     cd uccl && \
-    bash /tmp/patch_uccl_ep_empty_tensor.sh /tmp/uccl/ep/src/uccl_ep.cc && \
+    git apply /tmp/uccl-pr-1020.diff && \
+    git apply /tmp/uccl-pr-1021.diff && \
     cd ep && \
     EFA_HOME=/opt/amazon/efa TORCH_CUDA_ARCH_LIST="9.0+PTX" \
     python setup.py build_ext --inplace && \
@@ -101,14 +118,23 @@ RUN UCCL_DIR=$(python3 -c "import uccl; print(uccl.__path__[0])") && \
     pip install --no-deps . && \
     rm -rf /tmp/uccl
 
-# ---- LongCat-2.0 PD-disaggregation n-gram embedding fix ----
-# The disaggregation prefill/decode scheduler loops don't call
-# Scheduler._maybe_prepare_ngram_embedding, so batch.ne_token_table stays None and
-# LongCat-2.0's compute_n_gram_ids / update_token_table crash with
-# "Mismatched type ... Expected DLTensor* but got None" on every disagg TP rank.
-# This wires the prep call into all four disagg loops. Remove once upstream fixes it.
-COPY patch_longcat2_disagg_ngram.sh /tmp/patch_longcat2_disagg_ngram.sh
-RUN bash /tmp/patch_longcat2_disagg_ngram.sh /sgl-workspace/sglang/python/sglang/srt
+# ---- LongCat-2.0 real-EP fixes (sglang PRs, applied to the base image's tree) ----
+# These make LongCat-2.0 run + produce correct output under a real MoE a2a backend
+# (--moe-a2a-backend deepep). Each is a standard upstream PR diff; drop it once the
+# PR is merged into the base nightly.
+#   #30975: scheduler moe-topk gate — else --moe-a2a-backend is silently ignored.
+#   #31311: LongcatFlashMoE double all-reduce (garbage output) + ScMoE dense-branch
+#           gather (RoPE reshape crash), both gated on a2a != none.
+#   #31312: n-gram token-table crashes on padded (cuda-graph) decode batches.
+#   #31134: wire n-gram prep into the PD-disaggregation scheduler loops.
+COPY patches/sglang-pr-30975-moe-a2a-gate.diff        /tmp/pr-30975.diff
+COPY patches/sglang-pr-31311-longcat-real-ep.diff     /tmp/pr-31311.diff
+COPY patches/sglang-pr-31312-ngram-padded-batch.diff  /tmp/pr-31312.diff
+COPY patches/sglang-pr-31134-disagg-ngram.diff        /tmp/pr-31134.diff
+RUN cd /sgl-workspace/sglang && \
+    for d in /tmp/pr-30975.diff /tmp/pr-31311.diff /tmp/pr-31312.diff /tmp/pr-31134.diff; do \
+      echo "applying $d" && git apply "$d"; \
+    done
 
 # ---- EFA runtime env ----
 ENV FI_PROVIDER=efa
