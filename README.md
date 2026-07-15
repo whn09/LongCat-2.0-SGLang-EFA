@@ -12,6 +12,7 @@ PD 分离（Prefill/Decode disaggregation）方案。
 | `patches/*.diff` | 上游 PR 的标准 diff（构建时 `git apply`）：sglang #30975/#31311/#31312/#31134 + UCCL #1020/#1021。每个都可追溯到一个 PR，PR 合并进 base 后即可删 |
 | `scripts/serve-pd.sh` | 启动 Prefill / Decode 实例（tp16/ep16，PD 分离；prefill=deepep normal，decode=deepep low_latency） |
 | `scripts/serve-tp16.sh` | 启动**单个非分离**实例（tp16/ep16 跨 2 节点）——只有 2 节点、无法跑 PD 时用它做正确性/并发测试；含 `smoke` 子命令 |
+| `scripts/serve-tp32-1m.sh` | 启动**单个非分离**实例，tp32/ep32 跨 **4 节点**，面向 **1M 长上下文**（专家全 EP 分片省显存 + `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` 覆盖 256K 上限）；见 `LONGCAT2_1M_CONTEXT.md` |
 | `scripts/serve-router.sh` | 启动 PD router |
 
 > 注：`--moe-a2a-backend deepep` 是 UCCL-EP 在 sglang 里的接口开关（UCCL-EP 提供 DeepEP 兼容
@@ -53,6 +54,11 @@ bash scripts/serve-router.sh <prefill_ip> <decode_ip>  # 在 prefill head
 bash scripts/serve-tp16.sh 0 <head_ip>   # head
 bash scripts/serve-tp16.sh 1 <head_ip>   # node1
 bash scripts/serve-tp16.sh smoke         # 就绪后在 head 上
+
+# 2c. 1M 长上下文（4 节点 tp32/ep32 单实例，非分离）
+bash scripts/serve-tp32-1m.sh 0 <head_ip>   # rank 0 (head) .. rank 3
+#   长上下文用 fp8 KV 撑大 KV 池：KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv bash serve-tp32-1m.sh ...
+#   （fa3 在 fp8 下崩 "q/k must have same dtype"，必须配 flashmla_kv）
 ```
 
 关键 env / 参数（serve-pd.sh 已内置）：`MOONCAKE_PROTOCOL=efa`、`FI_HMEM_CUDA_USE_DMABUF=0`

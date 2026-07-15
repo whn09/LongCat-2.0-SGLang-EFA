@@ -25,7 +25,7 @@
 
 ## 二、启动命令
 
-镜像:`ucclep-longcat2-efa149-v3`(UCCL-EP MoE over EFA)。脚本:`scripts/serve-tp32-1m.sh`,4 节点各跑一条(head = P5EN-1 内网 IP):
+镜像:`ucclep-sglang-efa:latest`(UCCL-EP MoE over EFA,由 `Dockerfile.sglang-ucclep` 构建,含 `patches/*.diff` 的上游修复)。脚本:`scripts/serve-tp32-1m.sh`,4 节点各跑一条(head = P5EN-1 内网 IP):
 
 ```bash
 TP=32 EP=32 CP=0 NNODES=4 CTX_LEN=1048576 CHUNK=8192 MEM_FRAC=0.88 \
