@@ -19,19 +19,22 @@ PD 分离（Prefill/Decode disaggregation）方案。
 
 ### 内置的上游修复（构建时 `git apply patches/*.diff`）
 
-让 LongCat-2.0 在真 EP（`--moe-a2a-backend deepep`）下**跑通且输出正确**所需的修复，均为标准上游 PR：
+让 LongCat-2.0 在真 EP（`--moe-a2a-backend deepep`）下**跑通且输出正确**所需的全部上游 PR：
 
-| PR | 修什么 |
-|---|---|
-| sglang [#30975](https://github.com/sgl-project/sglang/pull/30975) | scheduler moe-topk gate（否则 `--moe-a2a-backend` 对 LongCat 静默失效） |
-| sglang [#31311](https://github.com/sgl-project/sglang/pull/31311) | MoE 后与 DeepEPMoE combine 的双重 all_reduce（乱码）+ ScMoE dense 分支 gather（RoPE 崩） |
-| sglang [#31312](https://github.com/sgl-project/sglang/pull/31312) | n-gram token-table 在 padded（cuda-graph）decode batch 下越界崩 |
-| sglang [#31134](https://github.com/sgl-project/sglang/pull/31134) | 把 n-gram 准备接入 PD 分离调度循环 |
-| UCCL [#1020](https://github.com/uccl-project/uccl/pull/1020) | internode TMA sender buffer 16384→20480（hidden=8192） |
-| UCCL [#1021](https://github.com/uccl-project/uccl/pull/1021) | WriteImm expert_idx 9→10 bit（768 expert，否则 LL 启动崩） |
+| PR | 修什么 | 状态 | 本仓如何应用 |
+|---|---|---|---|
+| sglang [#30975](https://github.com/sgl-project/sglang/pull/30975) | scheduler moe-topk gate（否则 `--moe-a2a-backend` 对 LongCat 静默失效） | open | `patches/sglang-pr-30975-moe-a2a-gate.diff` |
+| sglang [#31311](https://github.com/sgl-project/sglang/pull/31311) | MoE 后与 DeepEPMoE combine 的双重 all_reduce（乱码）+ ScMoE dense 分支 gather（RoPE 崩） | open | `patches/sglang-pr-31311-longcat-real-ep.diff` |
+| sglang [#31312](https://github.com/sgl-project/sglang/pull/31312) | n-gram token-table 在 padded（cuda-graph）decode batch 下越界崩 | open | `patches/sglang-pr-31312-ngram-padded-batch.diff` |
+| sglang [#31134](https://github.com/sgl-project/sglang/pull/31134) | 把 n-gram 准备接入 PD 分离调度循环 | open | `patches/sglang-pr-31134-disagg-ngram.diff` |
+| UCCL [#1020](https://github.com/uccl-project/uccl/pull/1020) | internode TMA sender buffer 16384→20480（hidden=8192） | open | `patches/uccl-pr-1020-tma-hidden8192.diff` |
+| UCCL [#1021](https://github.com/uccl-project/uccl/pull/1021) | WriteImm expert_idx 9→10 bit（768 expert，否则 LL 启动崩） | open | `patches/uccl-pr-1021-expert-idx-10bit.diff` |
+| UCCL [#1016](https://github.com/uccl-project/uccl/pull/1016) | kNumMaxTopK 9→16（LongCat moe_topk=12） | **已合并** | 无需（已在 uccl main） |
+| UCCL empty-tensor（topk_idx_ptr==0 / num_tokens==0） | DP-attention 空 batch 不崩 | **已在 main** | 无需 |
 
-> 这些 PR 合并进上游 nightly 后，把 base tag 升到含它们的镜像、删掉对应 diff 即可。UCCL #1016（kNumMaxTopK）
-> 和 empty-tensor 修复已在 uccl main，无需 patch。
+> `git apply` 依赖上下文匹配，故 base 镜像 tag **钉死日期**（`nightly-dev-cu13-20260715`）。
+> 上述 open 的 PR 一旦合并进某个 nightly，把 base tag 升上去、删掉对应 diff 即可（sglang #30387
+> zero-expert 修复和 #31154 ngram 重构就是这样被 20260715 base 自带、故本仓无需再 patch）。
 
 ## 快速开始
 
