@@ -50,8 +50,11 @@ MEM_FRAC="${MEM_FRAC:-0.85}"
 CHUNK="${CHUNK:-8192}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 DSA_BACKEND="${DSA_BACKEND:-fa3}"
-MAXRUN="${MAXRUN:-16}"
-DDT="${DDT:-128}"
+MAXRUN="${MAXRUN:-128}"
+# UCCL/DeepEP low-latency per-rank dispatch token cap (only used when DEEPEP_MODE=low_latency).
+# Must be >= the per-rank decode token count (~MAXRUN); 256 gives headroom over MAXRUN=128
+# without OOMing CUDA-graph capture (512 does OOM on LongCat). Ignored in normal mode.
+DDT="${DDT:-256}"
 
 # MoE all-to-all backend. Default deepep (real EP); set none for the EP-over-TP control.
 MOE_A2A="${MOE_A2A:-deepep}"
@@ -74,6 +77,7 @@ sudo docker run -d --name "$CONTAINER" --gpus all --network host --shm-size 64g 
     export FI_HMEM_CUDA_USE_DMABUF=0;
     export NCCL_SOCKET_IFNAME=${IFACE} GLOO_SOCKET_IFNAME=${IFACE};
     export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1;
+    export UCCL_EP_CPU_TIMEOUT_SECS=${UCCL_EP_CPU_TIMEOUT_SECS:-600};
     export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${DDT};
     python3 -m sglang.launch_server \
       --model-path /models/LongCat-2.0-FP8 --trust-remote-code \

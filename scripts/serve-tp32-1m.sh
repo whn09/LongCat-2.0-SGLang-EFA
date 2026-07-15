@@ -49,6 +49,7 @@ sudo docker run -d --name sglang-tp32 --gpus all --network host --shm-size 64g -
     export NCCL_TIMEOUT=7200 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200;
     # LongCat config derives max context 262144 (256K); 1M requires YARN extrapolation override.
     export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1;
+    export UCCL_EP_CPU_TIMEOUT_SECS=${UCCL_EP_CPU_TIMEOUT_SECS:-600};
     export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${DDT:-128};
     python3 -m sglang.launch_server \
       --model-path /models/LongCat-2.0-FP8 --trust-remote-code \

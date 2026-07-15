@@ -57,9 +57,12 @@ CTX_LEN="${CTX_LEN:-131072}"
 #   KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 DSA_BACKEND="${DSA_BACKEND:-fa3}"
+# Max concurrent requests in the running batch. Real ceiling is the KV pool
+# (max_total_num_tokens), not this; raise for more concurrency at shorter contexts.
+MAXRUN="${MAXRUN:-64}"
 # UCCL/DeepEP low-latency dispatch per-rank token cap (decode role). Must be >= the
-# per-rank token count; default 128. Raising it grows the LL RDMA buffer (and can OOM
-# CUDA-graph capture), so keep it just above your decode batch. Only affects LL mode.
+# per-rank token count (~MAXRUN); default 128. Raising it grows the LL RDMA buffer
+# (and can OOM CUDA-graph capture), so keep it just above your decode batch. LL only.
 DDT="${DDT:-128}"
 
 sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -80,12 +83,13 @@ sudo docker run -d --name "$CONTAINER" --gpus all --network host --shm-size 64g 
     export NCCL_SOCKET_IFNAME=${IFACE} GLOO_SOCKET_IFNAME=${IFACE};
     export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300;
     export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1;
+    export UCCL_EP_CPU_TIMEOUT_SECS=${UCCL_EP_CPU_TIMEOUT_SECS:-600};
     export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${DDT};
     python3 -m sglang.launch_server \
       --model-path /models/LongCat-2.0-FP8 --trust-remote-code \
       --tp 16 --ep 16 --nnodes 2 --node-rank ${RANK} --dist-init-addr ${HEADIP}:${DIST_PORT} \
       --context-length ${CTX_LEN} \
-      --max-running-requests 64 --mem-fraction-static ${MEM_FRAC} \
+      --max-running-requests ${MAXRUN} --mem-fraction-static ${MEM_FRAC} \
       --chunked-prefill-size ${CHUNK} --nsa-prefill-backend ${DSA_BACKEND} --kv-cache-dtype ${KV_DTYPE} \
       --moe-a2a-backend deepep --deepep-mode ${DEEPEP_MODE} \
       --disable-radix-cache \

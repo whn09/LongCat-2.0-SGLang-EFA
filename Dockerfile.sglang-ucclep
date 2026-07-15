@@ -150,4 +150,11 @@ ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/opt/amaz
 # which manifests as 3-5x slower prefill TTFT. Point NCCL directly at the plugin.
 ENV NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so
 
+# ---- UCCL-EP CPU dispatch timeout ----
+# UCCL exposes the CPU dispatch timeout as a runtime env (see common.hpp
+# get_cpu_timeout_secs), replacing the old patch_ep_cpu_timeout.sh source edit.
+# 600s so LongCat-2.0's DeepGEMM JIT warmup (many slow GEMM shapes on first run)
+# doesn't trip "timeout (dispatch CPU)" during EP dispatch.
+ENV UCCL_EP_CPU_TIMEOUT_SECS=600
+
 WORKDIR /workspace
