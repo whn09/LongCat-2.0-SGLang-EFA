@@ -122,6 +122,22 @@ temperature=0。经 router（:8000）端到端。
 |   32 |       28513.00 |         31297.40 |      34204.76 |            8388 |
 |   64 |       55983.92 |         62562.46 |      64350.20 |            8374 |
 
+### 真 EP 后端对比 —— Prefill TTFT（2026-07-15，delivery 镜像，非分离 tp16，ISL=1024，OSL=1）
+
+单个非分离实例（`serve-tp16.sh`）上对比 MoE all-to-all 后端：`a2a=none`（EP-over-TP）
+vs `deepep normal`（UCCL-EP 真 EP dispatch）。均在同一镜像/机器，`sglang.bench_serving` random。
+
+| conc | none — Mean TTFT | none — tput | deepep normal — Mean TTFT | deepep normal — tput |
+|-----:|-----------------:|------------:|--------------------------:|---------------------:|
+|    1 |          236 ms  | 4307 tok/s  |                   687 ms  |          1489 tok/s  |
+|    8 |          857 ms  | 9411 tok/s  |                  1266 ms  |          6400 tok/s  |
+|   32 |         3030 ms  | 10263 tok/s |             **2806 ms**   |     **10901 tok/s**  |
+
+- **低并发 none 更快**（真 EP 的 all-to-all 通信开销 > 省下的计算）；**conc=32 时 deepep normal 反超**
+  （大 batch 摊薄 all-to-all 开销，TTFT 更低、吞吐更高）。
+- 结论：2 机 16 卡规模，prefill 走 `deepep normal` 在高并发有优势；低并发/图省事用 `none`。
+- Decode 的后端对比（normal 通信受限很慢、LL 需专门调参）待补，见下节说明。
+
 ## 二、Decode —— TPOT（ISL = 1024，OSL = 1024）
 
 | conc | Mean TPOT (ms) | Median TPOT (ms) | P99 TPOT (ms) | Output tput (tok/s) |

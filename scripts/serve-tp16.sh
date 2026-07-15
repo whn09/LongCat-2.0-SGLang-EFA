@@ -13,10 +13,15 @@
 #
 # Env:
 #   MOE_A2A=deepep     real EP dispatch over UCCL-EP (default). none = EP-over-TP.
-#   DEEPEP_MODE=normal|low_latency  (default normal; LL keeps CUDA graph on for decode
-#                                    but needs small CHUNK / DDT — see below).
+#   DEEPEP_MODE=normal|low_latency  (default normal; LL keeps CUDA graph on for decode).
 #   DDT                LL per-rank dispatch token cap (default 128; only used by LL).
 #   IMG, MODEL_DIR, CTX_LEN, MEM_FRAC, CHUNK, KV_DTYPE, DSA_BACKEND, MAXRUN, PORT, DIST_PORT
+#
+# The MAXRUN=128 / DDT=256 defaults suit a2a=none and deepep normal. For
+# DEEPEP_MODE=low_latency, the LL RDMA buffer + CUDA-graph capture OOM at those
+# defaults on LongCat (119GB/GPU weights leave little room); use smaller values, e.g.
+#   MOE_A2A=deepep DEEPEP_MODE=low_latency CHUNK=64 MAXRUN=32 DDT=128 MEM_FRAC=0.80 ...
+# (CHUNK must also be small: LL dispatch caps per-rank tokens at DDT.)
 set -euo pipefail
 
 # --- smoke subcommand: hit the local server and print outputs for eyeballing ---
