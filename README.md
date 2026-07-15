@@ -1,8 +1,6 @@
 # LongCat-2.0-SGLang-EFA
 
-在 4× p5en.48xlarge（8×H200 + 16×200Gbps EFA）上，用 **SGLang + UCCL-EP（MoE all-to-all over EFA）
-+ Mooncake（KV over EFA）** 部署 **meituan-longcat/LongCat-2.0-FP8**（1.6T MoE，~48B 激活，FP8）的
-PD 分离（Prefill/Decode disaggregation）方案。
+在 4× p5en.48xlarge（8×H200 + 16×200Gbps EFA）上，用 **SGLang + UCCL-EP（MoE all-to-all over EFA）+ Mooncake（KV over EFA）** 部署 **meituan-longcat/LongCat-2.0-FP8**（1.6T MoE，~48B 激活，FP8）的 PD 分离（Prefill/Decode disaggregation）方案。
 
 ## 组成
 
