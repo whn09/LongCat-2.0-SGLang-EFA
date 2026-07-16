@@ -55,8 +55,9 @@ bash scripts/serve-tp16.sh smoke         # 就绪后在 head 上
 
 # 2c. 1M 长上下文（4 节点 tp32/ep32 单实例，非分离）
 bash scripts/serve-tp32-1m.sh 0 <head_ip>   # rank 0 (head) .. rank 3
-#   长上下文用 fp8 KV 撑大 KV 池：KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv bash serve-tp32-1m.sh ...
-#   （fa3 在 fp8 下崩 "q/k must have same dtype"，必须配 flashmla_kv）
+#   默认即 1M：fp8 KV（KV_DTYPE=fp8_e4m3）撑大 KV 池到 ~1.23M token + flashmla_kv 内核。
+#   （bf16 只到 ~752K 装不下 1M；fa3 在 fp8 下崩 "q/k must have same dtype"，故 fp8 必配 flashmla_kv）
+#   ≤512K 更快：显式 KV_DTYPE=bfloat16 DSA_BACKEND=fa3 CTX_LEN=524288 bash serve-tp32-1m.sh ...
 ```
 
 关键 env / 参数（serve-pd.sh 已内置）：`MOONCAKE_PROTOCOL=efa`、`FI_HMEM_CUDA_USE_DMABUF=0`

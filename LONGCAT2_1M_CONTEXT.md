@@ -28,8 +28,7 @@
 镜像:`ucclep-sglang-efa:latest`(UCCL-EP MoE over EFA,由 `Dockerfile.sglang-ucclep` 构建,含 `patches/*.diff` 的上游修复)。脚本:`scripts/serve-tp32-1m.sh`,4 节点各跑一条(head = P5EN-1 内网 IP):
 
 ```bash
-TP=32 EP=32 CP=0 NNODES=4 CTX_LEN=1048576 CHUNK=8192 MEM_FRAC=0.88 \
-MAX_RUNNING=1 KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv \
+# 默认值即为 1M 配置（fp8_e4m3 KV + flashmla_kv + chunk8192 + mem0.88），4 节点各跑一条：
 bash serve-tp32-1m.sh <node-rank 0..3> <head-ip>
 ```
 

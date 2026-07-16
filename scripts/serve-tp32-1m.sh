@@ -18,15 +18,21 @@ TP="${TP:-32}"
 EP="${EP:-32}"
 NNODES="${NNODES:-4}"
 CTX_LEN="${CTX_LEN:-1048576}"          # 1M
-CHUNK="${CHUNK:-16384}"
-MEM_FRAC="${MEM_FRAC:-0.85}"
+# chunk=8192 beats 16384 by ~40% at 1M: flashmla_kv exceeds GPU shared-memory at chunk
+# 16384 and falls back to a slow low-smem kernel; 8192 avoids that fallback.
+CHUNK="${CHUNK:-8192}"
+# 0.88 (not 0.85) so the fp8 KV pool reaches ~1.23M tokens = fits 1M. Do NOT raise to 0.93
+# (some nodes OOM loading the fp8 weights, leaving a broken world).
+MEM_FRAC="${MEM_FRAC:-0.88}"
 CP="${CP:-0}"                           # attn context parallel — MUST be 0 at tp32 (CP needs tp<=8)
 PORT="${PORT:-30000}"
 MAX_RUNNING="${MAX_RUNNING:-1}"         # lower => more KV pool for a single long request
-KV_DTYPE="${KV_DTYPE:-bfloat16}"       # bfloat16 = working ≤512K (fa3 compatible). fp8_e4m3 gives a
-                                        # >1M KV pool but fa3 crashes ("q/k must have same dtype");
-                                        # for fp8 try DSA_BACKEND=flashmla_kv (FlashMLA fp8-native).
-DSA_BACKEND="${DSA_BACKEND:-fa3}"      # DSA/NSA prefill kernel: fa3 | flashmla_kv | flashmla_auto | ...
+# Defaults target the full 1M context, which REQUIRES fp8 KV: bf16 KV pool only reaches
+# ~752K tokens (can't fit 1M); fp8_e4m3 halves per-token KV -> ~1.23M-token pool. fp8 in
+# turn REQUIRES flashmla_kv (FlashMLA, fp8-native) — fa3 crashes on fp8 ("query and key
+# must have the same dtype"). For ≤512K, bf16 + fa3 is faster: KV_DTYPE=bfloat16 DSA_BACKEND=fa3.
+KV_DTYPE="${KV_DTYPE:-fp8_e4m3}"
+DSA_BACKEND="${DSA_BACKEND:-flashmla_kv}"  # DSA/NSA prefill kernel: fa3 | flashmla_kv | flashmla_auto | ...
 
 # CP args (NSA prefill context parallel — LongCat uses NSA). Set CP=0 to disable.
 CP_ARGS=""
