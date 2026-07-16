@@ -50,9 +50,16 @@ DIST_PORT="${DIST_PORT:-20000}"
 IMG="${IMG:-ucclep-sglang-efa:latest}"
 MODEL_DIR="${MODEL_DIR:-/opt/dlami/nvme/LongCat-2.0-FP8}"
 IFACE="${IFACE:-$(ip -o -4 addr show | awk '$2!="lo" && $2!~"docker"{print $2; exit}')}"
-CTX_LEN="${CTX_LEN:-8192}"
+# context-length: 131072 (128K). LongCat-2.0's native context is 256K; capping to 128K
+# sizes the bf16 KV pool to ~62784 tokens (~5.7GB/rank) after the ~107GB/GPU weights on
+# tp16, which fits with MEM_FRAC 0.85 and fa3 (no fp8 needed). Leaving it unset would size
+# the pool for 256K and OOM the KV allocation (hangs after "Load weight end"). For >128K use
+# fp8 KV (KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv — fa3 crashes on fp8) or serve-tp32-1m.sh.
+CTX_LEN="${CTX_LEN:-131072}"
 MEM_FRAC="${MEM_FRAC:-0.85}"
 CHUNK="${CHUNK:-8192}"
+# bf16 KV + fa3: fastest for ≤128K and no fp8 conversion. (fp8 doubles the pool for longer
+# contexts but REQUIRES flashmla_kv; fa3 crashes on fp8 with "q/k must have same dtype".)
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 DSA_BACKEND="${DSA_BACKEND:-fa3}"
 MAXRUN="${MAXRUN:-128}"
