@@ -34,6 +34,15 @@ MAXRUN="${MAXRUN:-1}"                   # lower => more KV pool for a single lon
 KV_DTYPE="${KV_DTYPE:-fp8_e4m3}"
 DSA_BACKEND="${DSA_BACKEND:-flashmla_kv}"  # DSA/NSA prefill kernel: fa3 | flashmla_kv | flashmla_auto | ...
 
+# MoE all-to-all backend. Default deepep normal (real EP). MOE_A2A=none = EP-over-TP.
+# At 1M the two are ~equal (attention O(n^2) dominates; MoE dispatch is a small fraction).
+MOE_A2A="${MOE_A2A:-deepep}"
+case "$MOE_A2A" in
+  ""|none)  MOE_A2A_ARGS="" ;;
+  deepep)   MOE_A2A_ARGS="--moe-a2a-backend deepep --deepep-mode normal" ;;
+  *)        echo "MOE_A2A must be 'deepep' or 'none'"; exit 1 ;;
+esac
+
 # CP args (NSA prefill context parallel — LongCat uses NSA). Set CP=0 to disable.
 CP_ARGS=""
 if [ "${CP:-0}" != "0" ]; then
@@ -65,7 +74,7 @@ sudo docker run -d --name sglang-tp32 --gpus all --network host --shm-size 64g -
       --context-length ${CTX_LEN} \
       --max-running-requests ${MAXRUN} --mem-fraction-static ${MEM_FRAC} \
       --chunked-prefill-size ${CHUNK} --nsa-prefill-backend ${DSA_BACKEND} --kv-cache-dtype ${KV_DTYPE} \
-      --moe-a2a-backend deepep --deepep-mode normal \
+      ${MOE_A2A_ARGS} \
       --disable-radix-cache --allow-auto-truncate \
       --watchdog-timeout 1000000 --dist-timeout 7200 \
       --host 0.0.0.0 --port ${PORT}"

@@ -22,7 +22,7 @@
 
 | PR | 修什么 | 状态 | 本仓如何应用 |
 |---|---|---|---|
-| sglang [#30975](https://github.com/sgl-project/sglang/pull/30975) | scheduler moe-topk gate（否则 `--moe-a2a-backend` 对 LongCat 静默失效） | open | `patches/sglang-pr-30975-moe-a2a-gate.diff` |
+| sglang [#30975](https://github.com/sgl-project/sglang/pull/30975) | scheduler moe-topk gate（否则 `--moe-a2a-backend` 对 LongCat 静默失效） | **已合并** | 仍保留 diff（base nightly-20260715 早于合并点）；base 升过合并点后即可删 |
 | sglang [#31311](https://github.com/sgl-project/sglang/pull/31311) | MoE 后与 DeepEPMoE combine 的双重 all_reduce（乱码）+ ScMoE dense 分支 gather（RoPE 崩） | open | `patches/sglang-pr-31311-longcat-real-ep.diff` |
 | sglang [#31312](https://github.com/sgl-project/sglang/pull/31312) | n-gram token-table 在 padded（cuda-graph）decode batch 下越界崩 | open | `patches/sglang-pr-31312-ngram-padded-batch.diff` |
 | sglang [#31134](https://github.com/sgl-project/sglang/pull/31134) | 把 n-gram 准备接入 PD 分离调度循环 | open | `patches/sglang-pr-31134-disagg-ngram.diff` |
