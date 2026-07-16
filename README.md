@@ -123,20 +123,43 @@ temperature=0。经 router（:8000）端到端。
 |   32 |       28513.00 |         31297.40 |      34204.76 |            8388 |
 |   64 |       55983.92 |         62562.46 |      64350.20 |            8374 |
 
-### 真 EP 后端对比 —— Prefill TTFT（2026-07-15，delivery 镜像，非分离 tp16，ISL=1024，OSL=1）
+### 真 EP 后端对比 —— Prefill TTFT（2026-07-16，delivery 镜像，非分离 tp16，128K ctx，bf16 KV，OSL=1）
 
 单个非分离实例（`serve-tp16.sh`）上对比 MoE all-to-all 后端：`a2a=none`（EP-over-TP）
-vs `deepep normal`（UCCL-EP 真 EP dispatch）。均在同一镜像/机器，`sglang.bench_serving` random。
+vs `deepep normal`（UCCL-EP 真 EP dispatch）。同一镜像/机器，`sglang.bench_serving` random，
+`--random-range-ratio 1.0`（严格等长）。KV 池 `max_total_num_tokens=102656`。**粗体 = 更优。**
 
-| conc | none — Mean TTFT | none — tput | deepep normal — Mean TTFT | deepep normal — tput |
-|-----:|-----------------:|------------:|--------------------------:|---------------------:|
-|    1 |          236 ms  | 4307 tok/s  |                   687 ms  |          1489 tok/s  |
-|    8 |          857 ms  | 9411 tok/s  |                  1266 ms  |          6400 tok/s  |
-|   32 |         3030 ms  | 10263 tok/s |             **2806 ms**   |     **10901 tok/s**  |
+**ISL = 1024**
 
-- **低并发 none 更快**（真 EP 的 all-to-all 通信开销 > 省下的计算）；**conc=32 时 deepep normal 反超**
-  （大 batch 摊薄 all-to-all 开销，TTFT 更低、吞吐更高）。
-- 结论：2 机 16 卡规模，prefill 走 `deepep normal` 在高并发有优势；低并发/图省事用 `none`。
+| conc | none — TTFT / tput | deepep normal — TTFT / tput |
+|-----:|-------------------:|----------------------------:|
+|    1 | **236 ms** / 4293  |           699 ms / 1463     |
+|    4 | **517 ms** / 7729  |           962 ms / 4060     |
+|    8 | **864 ms** / 9334  |          1254 ms / 6454     |
+|   16 | **1555 ms** / 10431|          1770 ms / 9205     |
+|   32 |   3093 ms / 10374  | **2747 ms** / **11661**     |
+|   64 |   5596 ms / 10938  | **4640 ms** / **12841**     |
+
+**ISL = 8192**
+
+| conc | none — TTFT / tput  | deepep normal — TTFT / tput |
+|-----:|--------------------:|----------------------------:|
+|    1 | **1061 ms** / 7703  |          1259 ms / 6498     |
+|    4 |   3889 ms / 8168    | **3393 ms** / **9315**      |
+|   12 |  10839 ms / 8421    | **9136 ms** / **9920**      |
+
+**ISL = 65536**（KV 池限制，conc≥2 已靠 chunked-prefill 排队饱和）
+
+| conc | none — TTFT / tput  | deepep normal — TTFT / tput |
+|-----:|--------------------:|----------------------------:|
+|    1 |   8728 ms / 7507    | **7960 ms** / **8232**      |
+|    2 |  16675 ms / 7612    | **15069 ms** / **8425**     |
+
+- **crossover 点随 ISL 增大而左移**：ISL=1024 在 **conc≈32** 处 normal 反超；ISL=8192 提前到 **conc≈4**；
+  ISL=65536 则 **conc=1 起 normal 就领先**。
+- 机理：低并发/短输入时真 EP 的 all-to-all 固定开销 > 省下的计算，`none` 更快；
+  大 batch / 长序列时 all-to-all 被摊薄，且 EP 省掉了 `none` 的 all-gather 权重复制，`deepep normal` 反超。
+- 选型：**短输入低并发用 `none`（又快又省事）；长输入或高并发用 `deepep normal`**。
 - Decode 的后端对比（normal 通信受限很慢、LL 需专门调参）待补，见下节说明。
 
 ## 二、Decode —— TPOT（ISL = 1024，OSL = 1024）
