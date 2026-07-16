@@ -57,7 +57,7 @@ IFACE="${IFACE:-$(ip -o -4 addr show | awk '$2!="lo" && $2!~"docker"{print $2; e
 # fp8 KV (KV_DTYPE=fp8_e4m3 DSA_BACKEND=flashmla_kv — fa3 crashes on fp8) or serve-tp32-1m.sh.
 CTX_LEN="${CTX_LEN:-131072}"
 MEM_FRAC="${MEM_FRAC:-0.85}"
-CHUNK="${CHUNK:-8192}"
+CHUNK="${CHUNK:-16384}"
 # bf16 KV + fa3: fastest for ≤128K and no fp8 conversion. (fp8 doubles the pool for longer
 # contexts but REQUIRES flashmla_kv; fa3 crashes on fp8 with "q/k must have same dtype".)
 KV_DTYPE="${KV_DTYPE:-bfloat16}"

@@ -59,6 +59,9 @@ KV_DTYPE="${KV_DTYPE:-bfloat16}"
 DSA_BACKEND="${DSA_BACKEND:-fa3}"
 # Max concurrent requests in the running batch. Real ceiling is the KV pool
 # (max_total_num_tokens), not this; raise for more concurrency at shorter contexts.
+# Kept LOWER than serve-tp16 (128) ON PURPOSE: the decode instance defaults to
+# low_latency, where MAXRUN drives the LL RDMA buffer / CUDA-graph capture size, and
+# 128 OOMs capture on LongCat (119GB/GPU weights leave little room). 64 starts cleanly.
 MAXRUN="${MAXRUN:-64}"
 # UCCL/DeepEP low-latency dispatch per-rank token cap (decode role). Must be >= the
 # per-rank token count (~MAXRUN); default 128. Raising it grows the LL RDMA buffer

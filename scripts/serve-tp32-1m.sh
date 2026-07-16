@@ -26,7 +26,7 @@ CHUNK="${CHUNK:-8192}"
 MEM_FRAC="${MEM_FRAC:-0.88}"
 CP="${CP:-0}"                           # attn context parallel — MUST be 0 at tp32 (CP needs tp<=8)
 PORT="${PORT:-30000}"
-MAX_RUNNING="${MAX_RUNNING:-1}"         # lower => more KV pool for a single long request
+MAXRUN="${MAXRUN:-1}"                   # lower => more KV pool for a single long request (1 = one 1M req)
 # Defaults target the full 1M context, which REQUIRES fp8 KV: bf16 KV pool only reaches
 # ~752K tokens (can't fit 1M); fp8_e4m3 halves per-token KV -> ~1.23M-token pool. fp8 in
 # turn REQUIRES flashmla_kv (FlashMLA, fp8-native) — fa3 crashes on fp8 ("query and key
@@ -63,7 +63,7 @@ sudo docker run -d --name sglang-tp32 --gpus all --network host --shm-size 64g -
       ${CP_ARGS} \
       --nnodes ${NNODES} --node-rank ${RANK} --dist-init-addr ${HEADIP}:${DIST_PORT} \
       --context-length ${CTX_LEN} \
-      --max-running-requests ${MAX_RUNNING} --mem-fraction-static ${MEM_FRAC} \
+      --max-running-requests ${MAXRUN} --mem-fraction-static ${MEM_FRAC} \
       --chunked-prefill-size ${CHUNK} --nsa-prefill-backend ${DSA_BACKEND} --kv-cache-dtype ${KV_DTYPE} \
       --moe-a2a-backend deepep --deepep-mode normal \
       --disable-radix-cache --allow-auto-truncate \
