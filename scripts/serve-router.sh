@@ -16,7 +16,9 @@ set -euo pipefail
 PREFILL_IP="${1:?usage: serve-router.sh <prefill_ip> <decode_ip>}"
 DECODE_IP="${2:?usage: serve-router.sh <prefill_ip> <decode_ip>}"
 
-IMG="${IMG:-579019700964.dkr.ecr.us-east-2.amazonaws.com/ep-benchmarks-efa/uccl-ep-efa:ucclep-longcat2-efa149-v3}"
+# Same image as the serve scripts (any image with sglang works — the router only runs
+# sglang_router.launch_router and loads no model — but keep it consistent).
+IMG="${IMG:-ucclep-sglang-efa:latest}"
 PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
