@@ -31,6 +31,15 @@ case "$ROLE" in
   *) echo "ROLE must be 'prefill' or 'decode'"; exit 1 ;;
 esac
 
+# MoE all-to-all backend. Default deepep (real EP over UCCL-EP). Set MOE_A2A=none to run
+# both roles as EP-over-TP (baseline: measures the PD-topology gain without real EP).
+MOE_A2A="${MOE_A2A:-deepep}"
+case "$MOE_A2A" in
+  ""|none)  MOE_A2A_ARGS="" ;;
+  deepep)   MOE_A2A_ARGS="--moe-a2a-backend deepep --deepep-mode ${DEEPEP_MODE}" ;;
+  *)        echo "MOE_A2A must be 'deepep' or 'none'"; exit 1 ;;
+esac
+
 # UCCL-EP image built from Dockerfile.sglang-ucclep (base nightly-20260715 + the
 # sglang/UCCL real-EP PR fixes baked in — no runtime patching needed). Override IMG
 # to point at your registry copy.
@@ -94,7 +103,7 @@ sudo docker run -d --name "$CONTAINER" --gpus all --network host --shm-size 64g 
       --context-length ${CTX_LEN} \
       --max-running-requests ${MAXRUN} --mem-fraction-static ${MEM_FRAC} \
       --chunked-prefill-size ${CHUNK} --nsa-prefill-backend ${DSA_BACKEND} --kv-cache-dtype ${KV_DTYPE} \
-      --moe-a2a-backend deepep --deepep-mode ${DEEPEP_MODE} \
+      ${MOE_A2A_ARGS} \
       --disable-radix-cache \
       --disaggregation-mode ${ROLE} \
       --disaggregation-transfer-backend mooncake \

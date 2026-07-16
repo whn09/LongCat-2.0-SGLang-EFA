@@ -123,44 +123,24 @@ temperature=0。经 router（:8000）端到端。
 |   32 |       28513.00 |         31297.40 |      34204.76 |            8388 |
 |   64 |       55983.92 |         62562.46 |      64350.20 |            8374 |
 
-### 真 EP 后端对比 —— Prefill TTFT（2026-07-16，delivery 镜像，非分离 tp16，128K ctx，bf16 KV，OSL=1）
+### PD 分离后端对比 —— Prefill TTFT（2026-07-16，delivery 镜像，4 节点 1P1D，ISL=1024）
 
-单个非分离实例（`serve-tp16.sh`）上对比 MoE all-to-all 后端：`a2a=none`（EP-over-TP）
-vs `deepep normal`（UCCL-EP 真 EP dispatch）。同一镜像/机器，`sglang.bench_serving` random，
-`--random-range-ratio 1.0`（严格等长）。KV 池 `max_total_num_tokens=102656`。**粗体 = 更优。**
+真正的交付形态：**PD 分离**，Prefill 实例 = 2 节点 tp16/ep16，Decode 实例 = 2 节点 tp16/ep16，
+KV 经 Mooncake over EFA 传输，router 转发。端到端 TTFT（含 KV 传输）。对比两种 MoE 后端：
+- **deepep**：prefill=`deepep normal`，decode=`deepep low_latency`（`serve-pd.sh` 默认）
+- **none**：prefill/decode 都 `MOE_A2A=none`（EP-over-TP 基线）
 
-**ISL = 1024**
+| conc | deepep（P normal）TTFT / tput | none TTFT / tput |
+|-----:|------------------------------:|-----------------:|
+|    1 |                       675 ms  |     **~640 ms**  |
+|    4 |            743 ms / 5491      | **635 ms / 6415**|
+|    8 |           1044 ms / 7808      | **938 ms / 8653**|
+|   16 |       **1572 ms** / **10367**|    1633 ms / 9955|
+|   32 |       **2899 ms** / **11211**|    3218 ms / 9954|
+|   64 |       **4707 ms** / **13539**|    5856 ms / 10937|
 
-| conc | none — TTFT / tput | deepep normal — TTFT / tput |
-|-----:|-------------------:|----------------------------:|
-|    1 | **236 ms** / 4293  |           699 ms / 1463     |
-|    4 | **517 ms** / 7729  |           962 ms / 4060     |
-|    8 | **864 ms** / 9334  |          1254 ms / 6454     |
-|   16 | **1555 ms** / 10431|          1770 ms / 9205     |
-|   32 |   3093 ms / 10374  | **2747 ms** / **11661**     |
-|   64 |   5596 ms / 10938  | **4640 ms** / **12841**     |
-
-**ISL = 8192**
-
-| conc | none — TTFT / tput  | deepep normal — TTFT / tput |
-|-----:|--------------------:|----------------------------:|
-|    1 | **1061 ms** / 7703  |          1259 ms / 6498     |
-|    4 |   3889 ms / 8168    | **3393 ms** / **9315**      |
-|   12 |  10839 ms / 8421    | **9136 ms** / **9920**      |
-
-**ISL = 65536**（KV 池限制，conc≥2 已靠 chunked-prefill 排队饱和）
-
-| conc | none — TTFT / tput  | deepep normal — TTFT / tput |
-|-----:|--------------------:|----------------------------:|
-|    1 |   8728 ms / 7507    | **7960 ms** / **8232**      |
-|    2 |  16675 ms / 7612    | **15069 ms** / **8425**     |
-
-- **crossover 点随 ISL 增大而左移**：ISL=1024 在 **conc≈32** 处 normal 反超；ISL=8192 提前到 **conc≈4**；
-  ISL=65536 则 **conc=1 起 normal 就领先**。
-- 机理：低并发/短输入时真 EP 的 all-to-all 固定开销 > 省下的计算，`none` 更快；
-  大 batch / 长序列时 all-to-all 被摊薄，且 EP 省掉了 `none` 的 all-gather 权重复制，`deepep normal` 反超。
-- 选型：**短输入低并发用 `none`（又快又省事）；长输入或高并发用 `deepep normal`**。
-- Decode 的后端对比（none vs LL）见「二、Decode」末尾小节。
+- 低并发 `none` 略快（prefill 不做 all-to-all）；**conc≥16 起 deepep normal 反超**（大 batch 摊薄
+  all-to-all，且省掉 none 的 all-gather 权重复制）—— 和统一实例同样的 crossover 规律。
 
 ## 二、Decode —— TPOT（ISL = 1024，OSL = 1024）
 
@@ -174,26 +154,27 @@ vs `deepep normal`（UCCL-EP 真 EP dispatch）。同一镜像/机器，`sglang.
 |   32 |          38.51 |            38.57 |         40.68 |              635.67 |
 |   64 |          40.23 |            39.92 |         59.08 |              666.32 |
 
-### 真 EP 后端对比 —— Decode TPOT（2026-07-16，delivery 镜像，非分离 tp16，ISL=64）
+### PD 分离后端对比 —— Decode TPOT（2026-07-16，delivery 镜像，4 节点 1P1D，ISL=64，OSL=1024）
 
-`a2a=none`（EP-over-TP）vs `deepep low_latency`（UCCL-EP，cuda-graph 常开）。LL 用可起参数
-`CHUNK=64 MAXRUN=32 DDT=128 MEM_FRAC=0.80`（默认 MAXRUN=128/DDT=256 会 cuda-graph capture OOM）。
-并发上限 = MAXRUN=32（LL 的 RDMA buffer 固定几何，再高只会排队）。
+同一 PD 拓扑（decode 实例 = 2 节点 tp16/ep16，独占 GPU 不与 prefill 争），对比 decode 后端：
+- **deepep LL**：decode=`deepep low_latency`（cuda-graph 常开）。LL 参数 `MAXRUN=32 DDT=128`
+  （默认 MAXRUN=128/DDT=256 会 cuda-graph capture OOM），并发上限 = MAXRUN=32。
+- **none**：decode=`MOE_A2A=none`（EP-over-TP）。
 
-| conc | none — TPOT (OSL=1024) | deepep LL — TPOT (OSL=256) |
-|-----:|-----------------------:|---------------------------:|
-|    1 |            **24.2 ms** |                    47.6 ms |
-|    8 |            **28.6 ms** |                    50.3 ms |
-|   16 |            **34.8 ms** |                    66.8 ms |
-|   32 |            **38.1 ms** |                    69.3 ms |
-| GPU util | 93–95%（算力受限=健康） |            **99%**（含通信忙等） |
+| conc | deepep LL — TPOT | none — TPOT |
+|-----:|-----------------:|------------:|
+|    1 |          46.5 ms | **24.1 ms** |
+|    4 |          47.5 ms | **26.9 ms** |
+|    8 |          48.3 ms | **28.6 ms** |
+|   16 |          48.3 ms | **35.0 ms** |
+|   32 |          55.4 ms | **38.2 ms** |
 
-- **2 机 16 卡统一实例下，`none` 的 decode 全程比 LL 快约 2×**，即便 LL 的 cuda-graph 生效、GPU 打到 99%。
-- 机理：`none` 的 decode 是纯算力受限（TP all-gather 走节点内 NVLink，快）；LL 每个 decode step 都要
-  跨节点 EFA all-to-all，那 99% GPU 里含大量等 RDMA 的忙等，有效吞吐低于 none。
-- **LL 的价值不在 2 机统一实例，而在 PD 分离 + 规模化**：decode 节点专职小 batch decode，
-  不与 prefill 争 GPU，跨节点 EP dispatch 才划算。统一实例场景 decode 用 `none` 最优。
-- （备注：none 用 OSL=1024、LL 用 OSL=256；TPOT 为 per-token 稳态指标，跨 OSL 可比，不影响结论。）
+- **2 机 16 卡的 decode 实例规模下，`none` 全程比 LL 快**，即便 LL 的 cuda-graph 生效、GPU 99%。
+- 但 **LL 的 TPOT 曲线明显更平**：conc 1→32 只从 46.5 涨到 55.4 ms（+19%），而 none 从 24.1 涨到
+  38.2 ms（+58%）。趋势上并发越高两者越接近。
+- 机理：`none` decode 纯算力受限（TP all-gather 走节点内 NVLink）；LL 每 step 跨节点 EFA all-to-all，
+  那 99% GPU 含等 RDMA 的忙等。**LL 的真正拐点需要更大并发**（超过单 decode 实例 MAXRUN=32 上限，
+  需多 decode 实例横向扩），此规模下 decode 用 `none` 最优。
 
 ---
 
