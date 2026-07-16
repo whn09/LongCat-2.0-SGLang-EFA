@@ -97,12 +97,18 @@ temperature=0。经 router（:8000）端到端。
 
 ---
 
-## 一、Prefill —— TTFT（PD 分离后端对比，2026-07-16，delivery 镜像，4 节点 1P1D，ISL=1024）
+## 一、Prefill —— TTFT（PD 分离后端对比，2026-07-16，delivery 镜像，4 节点 1P1D）
 
 真正的交付形态：**PD 分离**，Prefill 实例 = 2 节点 tp16/ep16，Decode 实例 = 2 节点 tp16/ep16，
 KV 经 Mooncake over EFA 传输，router 转发。端到端 TTFT（含 KV 传输）。对比两种 MoE 后端：
 - **deepep**：prefill=`deepep normal`，decode=`deepep low_latency`（`serve-pd.sh` 默认）
 - **none**：prefill/decode 都 `MOE_A2A=none`（EP-over-TP 基线）
+
+bf16 KV，`sglang.bench_serving` random，`--random-range-ratio 1.0`（严格等长）。KV 池
+`max_total_num_tokens=102656`，故 64K 只能测到 conc≈2、128K 输入无法测（超池，需 fp8 KV，
+而 Mooncake 传 fp8 KV 暂不支持）。**粗体 = 更优。**
+
+**ISL = 1024**
 
 | conc | deepep（P normal）TTFT / tput | none TTFT / tput |
 |-----:|------------------------------:|-----------------:|
@@ -113,8 +119,27 @@ KV 经 Mooncake over EFA 传输，router 转发。端到端 TTFT（含 KV 传输
 |   32 |       **2899 ms** / **11211**|    3218 ms / 9954|
 |   64 |       **4707 ms** / **13539**|    5856 ms / 10937|
 
-- 低并发 `none` 略快（prefill 不做 all-to-all）；**conc≥16 起 deepep normal 反超**（大 batch 摊薄
-  all-to-all，且省掉 none 的 all-gather 权重复制）—— 和统一实例同样的 crossover 规律。
+**ISL = 8192**
+
+| conc | deepep（P normal）TTFT / tput | none TTFT / tput |
+|-----:|------------------------------:|-----------------:|
+|    1 |        **985 ms** / —        |   1092 ms / 7497 |
+|    4 |    **3466 ms** / **9129**    |   3986 ms / 8177 |
+|    8 |    **6504 ms** / **9832**    |   7702 ms / 8277 |
+|   16 |   **12395 ms** / **9929**    |  14842 ms / 8305 |
+
+**ISL = 65536**（KV 池限制，conc≥2 已靠 chunked-prefill 排队饱和）
+
+| conc | deepep（P normal）TTFT / tput | none TTFT / tput |
+|-----:|------------------------------:|-----------------:|
+|    1 |    **7594 ms** / **8629**    |   8823 ms / 7427 |
+|    2 |   **14398 ms** / **8818**    |  16803 ms / 7556 |
+
+- **crossover 点随 ISL 增大而左移**：ISL=1024 在 conc≈16 处 deepep 反超；ISL=8192 提前到 **conc=1**；
+  ISL=65536 则 deepep 全程领先（吞吐 +15%）。
+- 机理：低并发/短输入时真 EP 的 all-to-all 固定开销 > 省下的计算，`none` 略快；
+  大 batch / 长序列时 all-to-all 被摊薄，且 deepep 省掉 none 的 all-gather 权重复制，`deepep normal` 反超。
+- 选型：**短输入低并发用 `none`；长输入（≥8K）或高并发用 `deepep normal`**。
 
 ## 二、Decode —— TPOT（PD 分离后端对比，2026-07-16，delivery 镜像，4 节点 1P1D，ISL=64，OSL=1024）
 
