@@ -160,7 +160,7 @@ vs `deepep normal`（UCCL-EP 真 EP dispatch）。同一镜像/机器，`sglang.
 - 机理：低并发/短输入时真 EP 的 all-to-all 固定开销 > 省下的计算，`none` 更快；
   大 batch / 长序列时 all-to-all 被摊薄，且 EP 省掉了 `none` 的 all-gather 权重复制，`deepep normal` 反超。
 - 选型：**短输入低并发用 `none`（又快又省事）；长输入或高并发用 `deepep normal`**。
-- Decode 的后端对比（normal 通信受限很慢、LL 需专门调参）待补，见下节说明。
+- Decode 的后端对比（none vs LL）见「二、Decode」末尾小节。
 
 ## 二、Decode —— TPOT（ISL = 1024，OSL = 1024）
 
@@ -173,6 +173,27 @@ vs `deepep normal`（UCCL-EP 真 EP dispatch）。同一镜像/机器，`sglang.
 |   16 |          35.60 |            35.76 |         35.87 |              384.24 |
 |   32 |          38.51 |            38.57 |         40.68 |              635.67 |
 |   64 |          40.23 |            39.92 |         59.08 |              666.32 |
+
+### 真 EP 后端对比 —— Decode TPOT（2026-07-16，delivery 镜像，非分离 tp16，ISL=64）
+
+`a2a=none`（EP-over-TP）vs `deepep low_latency`（UCCL-EP，cuda-graph 常开）。LL 用可起参数
+`CHUNK=64 MAXRUN=32 DDT=128 MEM_FRAC=0.80`（默认 MAXRUN=128/DDT=256 会 cuda-graph capture OOM）。
+并发上限 = MAXRUN=32（LL 的 RDMA buffer 固定几何，再高只会排队）。
+
+| conc | none — TPOT (OSL=1024) | deepep LL — TPOT (OSL=256) |
+|-----:|-----------------------:|---------------------------:|
+|    1 |            **24.2 ms** |                    47.6 ms |
+|    8 |            **28.6 ms** |                    50.3 ms |
+|   16 |            **34.8 ms** |                    66.8 ms |
+|   32 |            **38.1 ms** |                    69.3 ms |
+| GPU util | 93–95%（算力受限=健康） |            **99%**（含通信忙等） |
+
+- **2 机 16 卡统一实例下，`none` 的 decode 全程比 LL 快约 2×**，即便 LL 的 cuda-graph 生效、GPU 打到 99%。
+- 机理：`none` 的 decode 是纯算力受限（TP all-gather 走节点内 NVLink，快）；LL 每个 decode step 都要
+  跨节点 EFA all-to-all，那 99% GPU 里含大量等 RDMA 的忙等，有效吞吐低于 none。
+- **LL 的价值不在 2 机统一实例，而在 PD 分离 + 规模化**：decode 节点专职小 batch decode，
+  不与 prefill 争 GPU，跨节点 EP dispatch 才划算。统一实例场景 decode 用 `none` 最优。
+- （备注：none 用 OSL=1024、LL 用 OSL=256；TPOT 为 per-token 稳态指标，跨 OSL 可比，不影响结论。）
 
 ---
 
