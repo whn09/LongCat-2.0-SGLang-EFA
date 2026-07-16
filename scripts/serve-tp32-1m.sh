@@ -51,7 +51,7 @@ sudo docker run -d --name sglang-tp32 --gpus all --network host --shm-size 64g -
     export FI_PROVIDER=efa FI_EFA_USE_DEVICE_RDMA=1 FI_HMEM_CUDA_USE_DMABUF=0;
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True;
     export NCCL_SOCKET_IFNAME=${IFACE} GLOO_SOCKET_IFNAME=${IFACE};
-    export NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so;
+    # NCCL_NET_PLUGIN=ofi is baked into the image (Dockerfile.sglang-ucclep), no export needed.
     export NCCL_TIMEOUT=7200 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200;
     # LongCat config derives max context 262144 (256K); 1M requires YARN extrapolation override.
     export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1;

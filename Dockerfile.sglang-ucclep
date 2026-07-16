@@ -147,8 +147,15 @@ ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/opt/amaz
 # package, which ships ONLY libnccl-net-ofi.so — NOT the default name libnccl-net.so
 # that NCCL auto-loads. Without this, NCCL logs "NET/Plugin: Could not find:
 # libnccl-net.so" and falls back to TCP sockets (~14 GB/s vs ~400 GB/s over EFA),
-# which manifests as 3-5x slower prefill TTFT. Point NCCL directly at the plugin.
-ENV NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so
+# which manifests as 3-5x slower prefill TTFT.
+# Use the SHORT name "ofi" (NCCL expands it to libnccl-net-ofi.so, resolved via
+# ldconfig where the EFA installer registered /opt/amazon/ofi-nccl/lib). Do NOT pass
+# the absolute path here: NCCL 2.27.x treats NCCL_NET_PLUGIN as a short name and
+# templates it into "libnccl-net-<value>.so", so an absolute path becomes the bogus
+# "libnccl-net-/opt/.../libnccl-net-ofi.so.so" -> not found -> silent TCP fallback.
+# (NCCL 2.28+ happens to accept an absolute path, which is why the old value worked on
+# this cu13/NCCL-2.28 base — but "ofi" works on both 2.27 and 2.28, so it's the safe form.)
+ENV NCCL_NET_PLUGIN=ofi
 
 # ---- UCCL-EP CPU dispatch timeout ----
 # UCCL exposes the CPU dispatch timeout as a runtime env (see common.hpp
