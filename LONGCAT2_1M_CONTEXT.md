@@ -76,7 +76,22 @@ bash serve-tp32-1m.sh <node-rank 0..3> <head-ip>
 (对照:在**小消息 decode 场景**下 UCCL-EP 明显快于 DeepEP —— 见 LOWLATENCY_symm_vs_deepep_vs_uccl.md;
 但那是 MoE all-to-all 主导的场景,与 1M prefill 的 attention 主导场景不同。)
 
-## 七、原始日志
+## 七、deepep vs none(1M 单请求,2026-07-16,delivery 镜像 tp32/ep32/fp8/flashmla_kv/chunk8192)
+
+同一 UCCL-EP 交付镜像,对比 MoE 后端 `deepep normal` vs `none`（EP-over-TP，`MOE_A2A=none`）：
+
+| MoE 后端 | 1M 输入吞吐 | 相对 |
+|---|---|---|
+| deepep normal | 1718 tok/s | 基准 |
+| **none (EP-over-TP)** | **1946 tok/s** | **+13%** |
+
+**结论:1M 单请求下 `none` 反而比 `deepep` 快 ~13%。** 原因:1M 是 `MAX_RUNNING=1` 的极端低并发，
+没有并发 batch 来摊薄 deepep 的 all-to-all 固定开销，所以 none「无 all-to-all」的优势显现（即便 MoE
+只占 attention 主导总时间的一小部分，省下的通信仍是净收益）。这与 prefill 的通用规律一致：
+**低并发 none 更快，deepep 要靠大 batch 才反超**——1M 单请求正是最极端的低并发场景。
+选型：**1M 超长单请求用 `none`；高并发或 PD 分离场景才用 deepep。**
+
+## 八、原始日志
 
 - UCCL chunk16384:`/opt/dlami/nvme/tp32_1m_flashmla.log`(1401 tok/s,触发 low-smem fallback)
 - UCCL chunk8192:`/opt/dlami/nvme/tp32_1m_chunk8192.log`(1974 tok/s)
