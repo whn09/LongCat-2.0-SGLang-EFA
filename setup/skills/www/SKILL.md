@@ -96,7 +96,7 @@ instance_count 翻倍；第二组独立 dist-init-addr（组间无通信）；ro
 | 网卡 | **17 个接口** = 1x `interface`(纯 ENA 主网卡) + **16x** `efa-only` | AWS 官方推荐；主网卡不能是 efa-only；efa-only 不占 IP |
 | NetworkCardIndex/DeviceIndex | 主网卡 (card0, dev0)；EFA 为 **(card0, dev1)** + (card1..15, dev0) | **card0 有两个接口**——dev1 的 EFA 容易漏，漏了只有 15 个 EFA 设备 |
 | 根盘 | 1024 GiB gp3 加密 | 镜像层 + 系统 |
-| 数据盘 | 2048 GiB gp3 **16000 IOPS / 1000 MBps** 加密 | 默认 3000/125 对权重分发太慢 |
+| 数据盘 | 2048 GiB gp3 **16000 IOPS / 1500 MBps** 加密 | 默认 3000/125 对权重分发太慢 |
 | Placement Group | cluster 策略 | EFA 低延迟 |
 | IMDS | `http_tokens=required`, `hop_limit=2` | hop=2 容器内可访问 IMDS |
 | 开机方式 | 固定数量 `aws_instance`（**不用 ASG**） | CB 到期实例被回收，ASG 补机只会报错 |

@@ -70,7 +70,7 @@ variable "data_volume_size" {
 }
 
 # gp3 基线 3000 IOPS / 125 MBps 对模型加载太慢。
-# 2TB 盘按容量自动适配到较高档位；gp3 上限 16000 IOPS / 1000 MBps。
+# 2TB 盘按容量自动适配到较高档位；gp3 上限 16000 IOPS / 2000 MBps(需 IOPS≥8000)。
 variable "data_volume_iops" {
   type        = number
   description = "数据盘 IOPS（gp3 范围 3000-16000）"
@@ -79,8 +79,8 @@ variable "data_volume_iops" {
 
 variable "data_volume_throughput" {
   type        = number
-  description = "数据盘吞吐 MBps（gp3 范围 125-1000）"
-  default     = 1000
+  description = "数据盘吞吐 MBps（gp3 范围 125-2000,>1000 需 IOPS≥8000）"
+  default     = 1500
 }
 
 variable "efa_installer_version" {

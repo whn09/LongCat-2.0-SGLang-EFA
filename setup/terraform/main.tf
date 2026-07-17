@@ -11,7 +11,7 @@
 #   2. Capacity Block 要求 InstanceType + InstanceMarketOptions(capacity-block)
 #      + CapacityReservationTarget 全部嵌入 Launch Template
 #   3. EFA 必须: 单 AZ + cluster placement group + 自引用全通安全组
-#   4. 磁盘: 根盘 1TB gp3 + 数据盘 2TB gp3 16000 IOPS / 1000 MBps
+#   4. 磁盘: 根盘 1TB gp3 + 数据盘 2TB gp3 16000 IOPS / 1500 MBps
 # =====================================================================
 
 terraform {
