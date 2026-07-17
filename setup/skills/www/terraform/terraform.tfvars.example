@@ -20,6 +20,6 @@ allowed_ssh_cidr = "10.0.0.0/8"
 root_volume_size       = 1024
 data_volume_size       = 2048
 data_volume_iops       = 16000
-data_volume_throughput = 1000
+data_volume_throughput = 1500
 
 efa_installer_version = "1.48.0"

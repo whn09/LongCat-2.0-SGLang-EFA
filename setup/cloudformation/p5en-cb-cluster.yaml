@@ -44,7 +44,7 @@ Parameters:
     Default: 16000
   DataVolumeThroughput:
     Type: Number
-    Default: 1000
+    Default: 1500
   EfaInstallerVersion:
     Type: String
     Default: 1.48.0
